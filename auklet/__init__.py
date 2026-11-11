@@ -1,4 +1,4 @@
-"""Auklet — a browser engine written from scratch.
+"""Auklet \u2014 a browser engine written from scratch.
 
 Public API::
 
