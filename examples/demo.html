@@ -1,0 +1,52 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Auklet Demo</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: sans-serif; background: #0b1020; color: #e8ecf8; }
+  .hero { padding: 64px 48px; background: linear-gradient(135deg, #1b2a6b, #6d28d9); }
+  .hero h1 { font-size: 52px; margin: 0 0 12px; letter-spacing: -1px; }
+  .hero p { font-size: 19px; color: #c7d2fe; max-width: 620px; line-height: 1.6; margin: 0; }
+  .badge { display: inline-block; padding: 6px 14px; border-radius: 999px;
+           background: rgba(255,255,255,0.16); font-size: 13px; margin-bottom: 20px; }
+  .wrap { padding: 40px 48px; }
+  .grid { display: flex; gap: 20px; }
+  .card { flex: 1; background: #151b33; border: 1px solid #26304f; border-radius: 14px; padding: 22px; }
+  .card h3 { margin: 0 0 8px; font-size: 18px; color: #a5b4fc; }
+  .card p { margin: 0; color: #9aa6c4; line-height: 1.55; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 28px; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #26304f; }
+  th { color: #a5b4fc; font-weight: bold; }
+  .ok { color: #4ade80; }
+  .no { color: #f87171; }
+  ul { margin: 24px 0 0; padding-left: 22px; color: #9aa6c4; line-height: 1.9; }
+  .btn { display: inline-block; margin-top: 24px; padding: 12px 22px; border-radius: 10px;
+         background: #6366f1; color: white; text-decoration: none; font-weight: bold; }
+</style></head>
+<body>
+  <div class="hero">
+    <div class="badge">v1.0 · from scratch</div>
+    <h1>Auklet</h1>
+    <p>A browser engine written from scratch in Python: HTML parsing, CSS cascade,
+       block/inline/flex/table layout, rasterisation and a real JavaScript runtime.</p>
+    <a class="btn" href="#features">Explore features</a>
+  </div>
+  <div class="wrap">
+    <div class="grid">
+      <div class="card"><h3>HTML5 parser</h3><p>State-machine tokenizer and tree builder with implied end tags, raw text and entities.</p></div>
+      <div class="card"><h3>CSS engine</h3><p>Selectors, specificity, inheritance, shorthands, media queries and the cascade.</p></div>
+      <div class="card"><h3>Layout</h3><p>Block flow, inline line breaking, flexbox, tables, floats and absolute positioning.</p></div>
+    </div>
+    <table>
+      <tr><th>Subsystem</th><th>Status</th><th>Notes</th></tr>
+      <tr><td>HTML parsing</td><td class="ok">implemented</td><td>tokenizer + tree construction</td></tr>
+      <tr><td>CSS cascade</td><td class="ok">implemented</td><td>CSS 2.1 + flexbox subset</td></tr>
+      <tr><td>JavaScript</td><td class="ok">implemented</td><td>QuickJS + DOM bindings</td></tr>
+      <tr><td>GPU compositing</td><td class="no">not implemented</td><td>software raster only</td></tr>
+    </table>
+    <ul>
+      <li>Real line breaking with measured font metrics</li>
+      <li>Rounded corners, shadows, gradients and opacity</li>
+      <li>Event listeners, timers and live re-layout</li>
+    </ul>
+  </div>
+</body></html>
