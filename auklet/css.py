@@ -393,3 +393,836 @@ def _nth_match(expr: str, index: int) -> bool:
         return index == int(e)
     except ValueError:
         return False
+
+
+def _match_compound(el: Element, c: Compound) -> bool:
+    if c.tag and c.tag != "*" and el.tag != c.tag:
+        return False
+    for i in c.ids:
+        if el.attributes.get("id") != i:
+            return False
+    for cl in c.classes:
+        if cl not in el.classes:
+            return False
+    for name, val, op in c.attrs:
+        if name not in el.attributes:
+            return False
+        actual = el.attributes[name]
+        if op == "=" and actual != val:
+            return False
+        if op == "~=" and val not in actual.split():
+            return False
+        if op == "^=" and not actual.startswith(val):
+            return False
+        if op == "$=" and not actual.endswith(val):
+            return False
+        if op == "*=" and val not in actual:
+            return False
+        if op == "|=" and not (actual == val or actual.startswith(val + "-")):
+            return False
+    for name, arg in c.pseudos:
+        if not _match_pseudo(el, name, arg):
+            return False
+    return True
+
+
+def _element_index(el: Element) -> int:
+    if el.parent is None:
+        return 1
+    sibs = [c for c in el.parent.children if isinstance(c, Element)]
+    return sibs.index(el) + 1
+
+
+def _type_index(el: Element) -> int:
+    if el.parent is None:
+        return 1
+    sibs = [c for c in el.parent.children if isinstance(c, Element) and c.tag == el.tag]
+    return sibs.index(el) + 1
+
+
+def _match_pseudo(el: Element, name: str, arg: Optional[str]) -> bool:
+    if name == "first-child":
+        return _element_index(el) == 1
+    if name == "last-child":
+        if el.parent is None:
+            return True
+        sibs = [c for c in el.parent.children if isinstance(c, Element)]
+        return sibs and sibs[-1] is el
+    if name == "only-child":
+        if el.parent is None:
+            return True
+        return len([c for c in el.parent.children if isinstance(c, Element)]) == 1
+    if name == "first-of-type":
+        return _type_index(el) == 1
+    if name == "last-of-type":
+        if el.parent is None:
+            return True
+        sibs = [c for c in el.parent.children if isinstance(c, Element) and c.tag == el.tag]
+        return sibs and sibs[-1] is el
+    if name == "nth-child":
+        return _nth_match(arg or "0", _element_index(el))
+    if name == "nth-of-type":
+        return _nth_match(arg or "0", _type_index(el))
+    if name == "nth-last-child":
+        if el.parent is None:
+            return False
+        sibs = [c for c in el.parent.children if isinstance(c, Element)]
+        return _nth_match(arg or "0", len(sibs) - sibs.index(el))
+    if name == "not":
+        inner = parse_selector(arg or "")
+        if inner is None:
+            return True
+        return not matches(el, inner)
+    if name == "root":
+        return el.parent is not None and el.parent.node_type == 9
+    if name == "empty":
+        return not any(isinstance(c, Element) or (isinstance(c, Text) and c.data.strip())
+                       for c in el.children)
+    if name in ("link", "any-link"):
+        return el.tag in ("a", "area") and "href" in el.attributes
+    if name == "checked":
+        return "checked" in el.attributes or "selected" in el.attributes
+    if name == "disabled":
+        return "disabled" in el.attributes
+    if name == "enabled":
+        return "disabled" not in el.attributes
+    if name in ("hover", "active", "focus", "focus-within", "visited", "target"):
+        return False
+    if name == "is" or name == "where":
+        for part in _split_top(arg or "", ","):
+            s = parse_selector(part)
+            if s and matches(el, s):
+                return True
+        return False
+    return False
+
+
+def matches(el: Element, sel: ComplexSelector) -> bool:
+    return _match_from(el, sel, len(sel.parts) - 1)
+
+
+def _match_from(el: Node, sel: ComplexSelector, idx: int) -> bool:
+    if not isinstance(el, Element):
+        return False
+    if not _match_compound(el, sel.parts[idx]):
+        return False
+    if idx == 0:
+        return True
+    comb = sel.combinators[idx - 1]
+    if comb == " ":
+        p = el.parent
+        while p is not None:
+            if _match_from(p, sel, idx - 1):
+                return True
+            p = p.parent
+        return False
+    if comb == ">":
+        return _match_from(el.parent, sel, idx - 1)
+    if comb == "+":
+        sib = el.previous_sibling()
+        while sib is not None and not isinstance(sib, Element):
+            sib = sib.previous_sibling()
+        return _match_from(sib, sel, idx - 1)
+    if comb == "~":
+        sib = el.previous_sibling()
+        while sib is not None:
+            if isinstance(sib, Element) and _match_from(sib, sel, idx - 1):
+                return True
+            sib = sib.previous_sibling()
+        return False
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Declarations and rules
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Declaration:
+    prop: str
+    value: str
+    important: bool = False
+
+
+@dataclass
+class Rule:
+    selector: ComplexSelector
+    declarations: list[Declaration]
+    origin: str = "author"     # ua | author
+    order: int = 0
+    media: Optional[str] = None
+
+
+@dataclass
+class Stylesheet:
+    rules: list[Rule] = field(default_factory=list)
+    origin: str = "author"
+
+
+def strip_comments(text: str) -> str:
+    return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+
+
+def parse_declarations(text: str) -> list[Declaration]:
+    out = []
+    for chunk in _split_top(text, ";"):
+        if ":" not in chunk:
+            continue
+        prop, _, value = chunk.partition(":")
+        prop = prop.strip().lower()
+        value = value.strip()
+        if not prop or not value:
+            continue
+        important = False
+        if value.lower().endswith("!important"):
+            important = True
+            value = value[: -len("!important")].strip()
+        elif "!important" in value.lower():
+            value = re.sub(r"!\s*important", "", value, flags=re.I).strip()
+            important = True
+        out.append(Declaration(prop, value, important))
+    return out
+
+
+def parse_stylesheet(text: str, origin: str = "author", order_start: int = 0) -> Stylesheet:
+    text = strip_comments(text)
+    sheet = Stylesheet(origin=origin)
+    order = order_start
+    i = 0
+    n = len(text)
+    while i < n:
+        # find next rule or at-rule
+        while i < n and text[i] in " \t\r\n\f":
+            i += 1
+        if i >= n:
+            break
+        if text[i] == "@":
+            j = i
+            depth = 0
+            while j < n:
+                if text[j] == "{":
+                    depth += 1
+                elif text[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+                elif text[j] == ";" and depth == 0:
+                    j += 1
+                    break
+                j += 1
+            block = text[i:j]
+            m = re.match(r"@media\s*([^{]+)\{(.*)\}\s*$", block, re.S)
+            if m:
+                cond = m.group(1).strip()
+                inner = parse_stylesheet(m.group(2), origin, order)
+                for r in inner.rules:
+                    r.media = cond
+                    sheet.rules.append(r)
+                order += len(inner.rules)
+            i = j
+            continue
+        # selector up to '{'
+        j = text.find("{", i)
+        if j < 0:
+            break
+        sel_text = text[i:j].strip()
+        k = j + 1
+        depth = 1
+        while k < n and depth:
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+            k += 1
+        body = text[j + 1:k - 1]
+        decls = parse_declarations(body)
+        for part in _split_top(sel_text, ","):
+            sel = parse_selector(part)
+            if sel is not None and decls:
+                sheet.rules.append(Rule(sel, decls, origin, order))
+                order += 1
+        i = k
+    return sheet
+
+
+def media_matches(cond: str, viewport: tuple[float, float]) -> bool:
+    if not cond:
+        return True
+    c = cond.lower().strip()
+    if c in ("all", "screen"):
+        return True
+    if c in ("print", "speech"):
+        return False
+    w, h = viewport
+    for part in re.split(r"\band\b", c):
+        part = part.strip()
+        m = re.match(r"\(\s*(min|max)-(width|height)\s*:\s*([\d.]+)(px|em|rem)?\s*\)", part)
+        if m:
+            kind, dim, num, unit = m.groups()
+            val = float(num) * (16 if unit in ("em", "rem") else 1)
+            actual = w if dim == "width" else h
+            if kind == "min" and actual < val:
+                return False
+            if kind == "max" and actual > val:
+                return False
+            continue
+        m = re.match(r"\(\s*(width|height)\s*:\s*([\d.]+)(px)?\s*\)", part)
+        if m:
+            dim, num = m.group(1), float(m.group(2))
+            actual = w if dim == "width" else h
+            if abs(actual - num) > 0.5:
+                return False
+            continue
+        if part.startswith("(") and "prefers-color-scheme" in part:
+            if "dark" in part:
+                return False
+            continue
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Property metadata
+# ---------------------------------------------------------------------------
+
+INHERITED = {
+    "color", "font-family", "font-size", "font-weight", "font-style", "line-height",
+    "text-align", "text-transform", "letter-spacing", "word-spacing", "white-space",
+    "list-style-type", "list-style-position", "visibility", "cursor", "text-indent",
+    "font-variant", "direction", "border-collapse", "border-spacing", "quotes",
+}
+
+INITIAL = {
+    "display": "inline",
+    "position": "static",
+    "top": "auto", "right": "auto", "bottom": "auto", "left": "auto",
+    "width": "auto", "height": "auto",
+    "min-width": "0", "min-height": "0", "max-width": "none", "max-height": "none",
+    "margin-top": "0", "margin-right": "0", "margin-bottom": "0", "margin-left": "0",
+    "padding-top": "0", "padding-right": "0", "padding-bottom": "0", "padding-left": "0",
+    "border-top-width": "0", "border-right-width": "0", "border-bottom-width": "0", "border-left-width": "0",
+    "border-top-style": "none", "border-right-style": "none", "border-bottom-style": "none", "border-left-style": "none",
+    "border-top-color": "currentcolor", "border-right-color": "currentcolor",
+    "border-bottom-color": "currentcolor", "border-left-color": "currentcolor",
+    "border-top-left-radius": "0", "border-top-right-radius": "0",
+    "border-bottom-right-radius": "0", "border-bottom-left-radius": "0",
+    "background-color": "transparent", "background-image": "none",
+    "background-repeat": "repeat", "background-size": "auto", "background-position": "0% 0%",
+    "color": "black",
+    "font-family": "sans-serif", "font-size": "16px", "font-weight": "400",
+    "font-style": "normal", "line-height": "normal",
+    "text-align": "left", "text-decoration": "none", "text-transform": "none",
+    "letter-spacing": "normal", "word-spacing": "normal", "white-space": "normal",
+    "vertical-align": "baseline",
+    "overflow": "visible", "overflow-x": "visible", "overflow-y": "visible",
+    "flex-direction": "row", "flex-wrap": "nowrap", "justify-content": "flex-start",
+    "align-items": "stretch", "align-self": "auto", "align-content": "stretch",
+    "flex-grow": "0", "flex-shrink": "1", "flex-basis": "auto",
+    "gap": "0", "row-gap": "0", "column-gap": "0", "order": "0",
+    "opacity": "1", "z-index": "auto", "visibility": "visible",
+    "list-style-type": "disc", "list-style-position": "outside",
+    "float": "none", "clear": "none", "box-sizing": "content-box",
+    "box-shadow": "none", "transform": "none", "content": "normal",
+    "border-collapse": "separate", "border-spacing": "0",
+    "text-indent": "0", "cursor": "auto", "direction": "ltr",
+    "table-layout": "auto", "object-fit": "fill", "aspect-ratio": "auto",
+    "outline": "none", "outline-width": "0", "outline-style": "none", "outline-color": "currentcolor",
+    "text-overflow": "clip", "word-break": "normal", "overflow-wrap": "normal",
+    "filter": "none", "mix-blend-mode": "normal", "transition": "none",
+    "animation": "none", "grid-template-columns": "none", "grid-template-rows": "none",
+    "grid-column": "auto", "grid-row": "auto", "place-items": "normal",
+    "inset": "auto", "border": "none", "background": "transparent",
+    "font": "normal", "flex": "0 1 auto", "list-style": "disc outside",
+    "text-shadow": "none", "caret-color": "auto", "pointer-events": "auto",
+    "user-select": "auto", "resize": "none", "appearance": "auto",
+}
+
+SIDES = ("top", "right", "bottom", "left")
+
+# Shorthands expanded at parse time.
+def expand_shorthand(prop: str, value: str) -> list[tuple[str, str]]:
+    v = value.strip()
+    low = v.lower()
+    out: list[tuple[str, str]] = []
+
+    def four(prefix: str, suffix: str = ""):
+        parts = _split_ws(v)
+        if len(parts) == 1:
+            parts = parts * 4
+        elif len(parts) == 2:
+            parts = [parts[0], parts[1], parts[0], parts[1]]
+        elif len(parts) == 3:
+            parts = [parts[0], parts[1], parts[2], parts[1]]
+        for side, p in zip(SIDES, parts):
+            out.append((f"{prefix}-{side}{suffix}", p))
+
+    if prop == "margin":
+        four("margin")
+    elif prop == "padding":
+        four("padding")
+    elif prop == "inset":
+        four("inset")
+    elif prop == "border-width":
+        four("border", "-width")
+    elif prop == "border-style":
+        four("border", "-style")
+    elif prop == "border-color":
+        four("border", "-color")
+    elif prop == "border-radius":
+        parts = _split_ws(v)
+        if len(parts) == 1:
+            parts = parts * 4
+        elif len(parts) == 2:
+            parts = [parts[0], parts[1], parts[0], parts[1]]
+        elif len(parts) == 3:
+            parts = [parts[0], parts[1], parts[2], parts[1]]
+        for key, p in zip(("border-top-left-radius", "border-top-right-radius",
+                           "border-bottom-right-radius", "border-bottom-left-radius"), parts):
+            out.append((key, p))
+    elif prop == "border":
+        width, style, color = _parse_border(v)
+        for side in SIDES:
+            out.append((f"border-{side}-width", width))
+            out.append((f"border-{side}-style", style))
+            out.append((f"border-{side}-color", color))
+    elif prop in ("border-top", "border-right", "border-bottom", "border-left"):
+        side = prop.split("-")[1]
+        width, style, color = _parse_border(v)
+        out.append((f"border-{side}-width", width))
+        out.append((f"border-{side}-style", style))
+        out.append((f"border-{side}-color", color))
+    elif prop == "background":
+        color = "transparent"
+        image = "none"
+        for tok in _split_ws(v):
+            tl = tok.lower()
+            if tl.startswith("url(") or "gradient(" in tl:
+                image = tok
+            elif parse_color(tok) is not None:
+                color = tok
+        out.append(("background-color", color))
+        out.append(("background-image", image))
+    elif prop == "font":
+        size = "16px"
+        family = "sans-serif"
+        weight = "400"
+        style = "normal"
+        lh = "normal"
+        parts = _split_ws(v)
+        for p in parts:
+            pl = p.lower()
+            if pl in ("bold", "bolder", "lighter") or (pl.isdigit() and 100 <= int(pl) <= 900):
+                weight = p
+            elif pl in ("italic", "oblique"):
+                style = p
+            elif "/" in p:
+                sz, _, l = p.partition("/")
+                size = sz
+                lh = l
+            elif parse_length(p) is not None and parse_length(p).unit != "auto":
+                size = p
+            elif pl in ("serif", "sans-serif", "monospace", "cursive", "fantasy") or "," in p:
+                family = p
+        out.append(("font-size", size))
+        out.append(("font-family", family))
+        out.append(("font-weight", weight))
+        out.append(("font-style", style))
+        out.append(("line-height", lh))
+    elif prop == "flex":
+        parts = _split_ws(v)
+        if len(parts) == 1:
+            if parts[0] == "none":
+                out += [("flex-grow", "0"), ("flex-shrink", "0"), ("flex-basis", "auto")]
+            elif parts[0] == "auto":
+                out += [("flex-grow", "1"), ("flex-shrink", "1"), ("flex-basis", "auto")]
+            elif parts[0].isdigit():
+                out += [("flex-grow", parts[0]), ("flex-shrink", "1"), ("flex-basis", "0")]
+            else:
+                out += [("flex-grow", "1"), ("flex-shrink", "1"), ("flex-basis", parts[0])]
+        else:
+            out.append(("flex-grow", parts[0]))
+            if len(parts) > 1:
+                out.append(("flex-shrink", parts[1]))
+            if len(parts) > 2:
+                out.append(("flex-basis", parts[2]))
+    elif prop == "gap":
+        parts = _split_ws(v)
+        out.append(("row-gap", parts[0]))
+        out.append(("column-gap", parts[1] if len(parts) > 1 else parts[0]))
+    elif prop == "overflow":
+        parts = _split_ws(v)
+        out.append(("overflow-x", parts[0]))
+        out.append(("overflow-y", parts[1] if len(parts) > 1 else parts[0]))
+    elif prop == "list-style":
+        for tok in _split_ws(v):
+            if tok in ("inside", "outside"):
+                out.append(("list-style-position", tok))
+            elif tok != "none":
+                out.append(("list-style-type", tok))
+    elif prop == "text-decoration":
+        out.append(("text-decoration", v))
+    elif prop == "outline":
+        out.append(("outline", v))
+    elif prop == "place-items":
+        parts = _split_ws(v)
+        out.append(("align-items", parts[0]))
+    else:
+        out.append((prop, v))
+    return out
+
+
+def _split_ws(v: str) -> list[str]:
+    out, depth, cur, quote = [], 0, [], None
+    for ch in v:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            cur.append(ch)
+        elif ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")":
+            depth -= 1
+            cur.append(ch)
+        elif ch.isspace() and depth == 0:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _parse_border(v: str) -> tuple[str, str, str]:
+    width, style, color = "medium", "none", "currentcolor"
+    for tok in _split_ws(v):
+        tl = tok.lower()
+        if tl in ("none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset"):
+            style = tl
+        elif tl in ("thin", "medium", "thick"):
+            width = {"thin": "1px", "medium": "3px", "thick": "5px"}[tl]
+        elif parse_length(tok) is not None:
+            width = tok
+        elif parse_color(tok) is not None:
+            color = tok
+    return width, style, color
+
+
+# ---------------------------------------------------------------------------
+# Computed style
+# ---------------------------------------------------------------------------
+
+class ComputedStyle:
+    """A resolved style: every property present, lengths kept symbolic."""
+
+    __slots__ = ("props", "element", "pseudo")
+
+    def __init__(self, props: dict, element: Optional[Element] = None, pseudo: Optional[str] = None):
+        self.props = props
+        self.element = element
+        self.pseudo = pseudo
+
+    def __getitem__(self, key: str):
+        return self.props.get(key, INITIAL.get(key, ""))
+
+    def get(self, key: str, default=None):
+        return self.props.get(key, INITIAL.get(key, default))
+
+    def length(self, key: str) -> Length:
+        v = self.props.get(key, INITIAL.get(key, "0"))
+        l = parse_length(v)
+        return l if l is not None else ZERO
+
+    def color(self, key: str = "color") -> tuple:
+        cur = self.props.get("color", "black")
+        cur_c = parse_color(cur) or (0, 0, 0, 255)
+        return parse_color(self.props.get(key, ""), cur_c) or (0, 0, 0, 0)
+
+    def number(self, key: str, default: float = 0.0) -> float:
+        v = self.props.get(key, "")
+        try:
+            return float(str(v).strip().rstrip("px"))
+        except (TypeError, ValueError):
+            return default
+
+    def is_bold(self) -> bool:
+        w = str(self.props.get("font-weight", "400")).lower()
+        if w in ("bold", "bolder"):
+            return True
+        try:
+            return int(w) >= 600
+        except ValueError:
+            return False
+
+    def font_families(self) -> list[str]:
+        fam = self.props.get("font-family", "sans-serif")
+        return [f.strip().strip("'\"") for f in fam.split(",") if f.strip()]
+
+    def __repr__(self):  # pragma: no cover
+        return f"<ComputedStyle {self.element.tag if self.element else '?'} {self.props.get('display')}>"
+
+
+def _initial_props() -> dict:
+    return dict(INITIAL)
+
+
+class StyleEngine:
+    def __init__(self, viewport=(1280, 800)):
+        self.viewport = viewport
+        self.sheets: list[Stylesheet] = []
+        self._cache: dict[int, ComputedStyle] = {}
+        self.root_font_size = 16.0
+
+    def add_sheet(self, sheet: Stylesheet) -> None:
+        self.sheets.append(sheet)
+
+    def add_css(self, text: str, origin: str = "author") -> None:
+        self.add_sheet(parse_stylesheet(text, origin))
+
+    # -- cascade -------------------------------------------------------
+    def _declarations_for(self, el: Element, pseudo: Optional[str]) -> list[tuple]:
+        """Return (sort_key, prop, value) for every matching declaration."""
+        entries = []
+        order = 0
+        for sheet in self.sheets:
+            for rule in sheet.rules:
+                if rule.media and not media_matches(rule.media, self.viewport):
+                    continue
+                if rule.selector.parts[-1].pseudo_element != pseudo:
+                    # a rule with a pseudo-element only applies to that pseudo
+                    if rule.selector.parts[-1].pseudo_element is not None:
+                        continue
+                if not matches(el, rule.selector):
+                    continue
+                spec = rule.selector.specificity()
+                origin_rank = 0 if sheet.origin == "ua" else 1
+                for d in rule.declarations:
+                    key = (1 if d.important else 0, origin_rank, spec, order)
+                    entries.append((key, d.prop, d.value))
+                order += 1
+        # inline style
+        if pseudo is None and el.style_attr:
+            for d in parse_declarations(el.style_attr):
+                key = (1 if d.important else 0, 2, (0, 0, 0), 10 ** 9)
+                entries.append((key, d.prop, d.value))
+        entries.sort(key=lambda e: e[0])
+        return entries
+
+    def compute(self, el: Element, parent: Optional[ComputedStyle],
+                pseudo: Optional[str] = None) -> ComputedStyle:
+        props = _initial_props()
+        # inheritance
+        if parent is not None:
+            for p in INHERITED:
+                if p in parent.props:
+                    props[p] = parent.props[p]
+        # UA defaults for display
+        props["display"] = ua_display(el.tag)
+
+        specified: dict[str, str] = {}
+        for _key, prop, value in self._declarations_for(el, pseudo):
+            for p, v in expand_shorthand(prop, value):
+                specified[p] = v
+
+        for p, v in specified.items():
+            lv = v.strip().lower()
+            if lv == "inherit":
+                if parent is not None and p in parent.props:
+                    props[p] = parent.props[p]
+                continue
+            if lv in ("initial", "unset"):
+                if lv == "unset" and p in INHERITED and parent is not None:
+                    props[p] = parent.props[p]
+                else:
+                    props[p] = INITIAL.get(p, props.get(p, ""))
+                continue
+            props[p] = v
+
+        # resolve font-size early (needed for em)
+        fs_raw = props.get("font-size", "16px")
+        parent_fs = 16.0
+        if parent is not None:
+            parent_fs = parent.number("font-size", 16.0) or 16.0
+        fs_len = parse_length(fs_raw)
+        if fs_len is None:
+            if fs_raw in ("smaller",):
+                fs = parent_fs * 0.833
+            elif fs_raw in ("larger",):
+                fs = parent_fs * 1.2
+            elif fs_raw in ("xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large"):
+                fs = {"xx-small": 9, "x-small": 10, "small": 13, "medium": 16,
+                      "large": 18, "x-large": 24, "xx-large": 32}[fs_raw]
+            else:
+                fs = parent_fs
+        else:
+            if fs_len.unit == "%":
+                fs = parent_fs * fs_len.value / 100.0
+            elif fs_len.unit == "em":
+                fs = parent_fs * fs_len.value
+            elif fs_len.unit == "rem":
+                fs = self.root_font_size * fs_len.value
+            else:
+                fs = resolve_length(fs_len, parent_fs, parent_fs, self.root_font_size, self.viewport)
+        props["font-size"] = f"{fs:g}px"
+
+        # line-height: normal -> 1.2 * font-size
+        lh = props.get("line-height", "normal")
+        if lh == "normal":
+            props["line-height"] = f"{fs * 1.2:g}px"
+        else:
+            lhl = parse_length(lh)
+            if lhl is not None:
+                if lhl.unit == "%":
+                    props["line-height"] = f"{fs * lhl.value / 100:g}px"
+                elif lhl.unit == "em":
+                    props["line-height"] = f"{fs * lhl.value:g}px"
+                elif lhl.unit == "px":
+                    props["line-height"] = f"{lhl.value:g}px"
+                else:
+                    props["line-height"] = f"{resolve_length(lhl, fs, fs, self.root_font_size, self.viewport):g}px"
+            else:
+                try:
+                    props["line-height"] = f"{float(lh) * fs:g}px"
+                except ValueError:
+                    props["line-height"] = f"{fs * 1.2:g}px"
+
+        # border widths: keywords
+        for side in SIDES:
+            key = f"border-{side}-width"
+            val = props.get(key, "0")
+            if val in ("thin", "medium", "thick"):
+                props[key] = {"thin": "1px", "medium": "3px", "thick": "5px"}[val]
+            if props.get(f"border-{side}-style", "none") in ("none", "hidden"):
+                props[key] = "0"
+
+        # currentColor resolution for borders/backgrounds
+        cur = parse_color(props.get("color", "black")) or (0, 0, 0, 255)
+        for side in SIDES:
+            key = f"border-{side}-color"
+            if str(props.get(key, "")).lower() == "currentcolor":
+                props[key] = f"rgba({cur[0]},{cur[1]},{cur[2]},{cur[3] / 255:.3f})"
+
+        # display fixups
+        if props.get("position") in ("absolute", "fixed") and props.get("display") == "inline":
+            props["display"] = "block"
+        if props.get("float") in ("left", "right") and props.get("display") == "inline":
+            props["display"] = "block"
+
+        style = ComputedStyle(props, el, pseudo)
+        return style
+
+    def compute_tree(self, root: Element) -> dict[int, ComputedStyle]:
+        """Compute styles for every element (and ::before/::after)."""
+        self._cache = {}
+        root_style = self.compute(root, None)
+        self.root_font_size = root_style.number("font-size", 16.0)
+        # recompute root with correct rem base
+        root_style = self.compute(root, None)
+        self._cache[id(root)] = root_style
+        stack = [(root, root_style)]
+        while stack:
+            el, st = stack.pop()
+            for child in el.children:
+                if isinstance(child, Element):
+                    cs = self.compute(child, st)
+                    self._cache[id(child)] = cs
+                    stack.append((child, cs))
+        return self._cache
+
+    def style_for(self, el: Element) -> Optional[ComputedStyle]:
+        return self._cache.get(id(el))
+
+
+def ua_display(tag: str) -> str:
+    if tag in ("html", "body", "div", "p", "h1", "h2", "h3", "h4", "h5", "h6",
+               "ul", "ol", "li", "dl", "dt", "dd", "section", "article", "header",
+               "footer", "nav", "main", "aside", "figure", "figcaption", "blockquote",
+               "pre", "form", "fieldset", "hr", "address", "details", "summary",
+               "legend"):
+        return "block"
+    if tag == "table":
+        return "table"
+    if tag == "caption":
+        return "table-caption"
+    if tag in ("thead", "tbody", "tfoot"):
+        return "table-row-group"
+    if tag in ("td", "th"):
+        return "table-cell"
+    if tag == "tr":
+        return "table-row"
+    if tag in ("thead", "tbody", "tfoot"):
+        return "table-row-group"
+    if tag == "li":
+        return "list-item"
+    if tag in ("head", "script", "style", "meta", "link", "title", "base", "template"):
+        return "none"
+    if tag in ("img", "input", "textarea", "select", "button", "canvas", "video", "iframe", "svg"):
+        return "inline-block"
+    return "inline"
+
+
+# ---------------------------------------------------------------------------
+# User-agent stylesheet
+# ---------------------------------------------------------------------------
+
+UA_CSS = """
+html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, dl, dt, dd, section,
+article, header, footer, nav, main, aside, figure, figcaption, blockquote,
+pre, form, fieldset, hr, address, details, summary, legend {
+  display: block;
+}
+table { display: table; }
+caption { display: table-caption; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; }
+head, script, style, meta, link, title, base, template { display: none; }
+body { margin: 8px; }
+h1 { font-size: 2em; font-weight: bold; margin: 0.67em 0; }
+h2 { font-size: 1.5em; font-weight: bold; margin: 0.83em 0; }
+h3 { font-size: 1.17em; font-weight: bold; margin: 1em 0; }
+h4 { font-size: 1em; font-weight: bold; margin: 1.33em 0; }
+h5 { font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }
+h6 { font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
+p { margin: 1em 0; }
+blockquote { margin: 1em 40px; }
+ul, ol { margin: 1em 0; padding-left: 40px; }
+ul { list-style-type: disc; }
+ol { list-style-type: decimal; }
+li { display: list-item; }
+dl { margin: 1em 0; }
+dd { margin-left: 40px; }
+pre { font-family: monospace; white-space: pre; margin: 1em 0; }
+code, kbd, samp, tt { font-family: monospace; }
+b, strong { font-weight: bold; }
+i, em, cite, var, dfn { font-style: italic; }
+u, ins { text-decoration: underline; }
+s, strike, del { text-decoration: line-through; }
+small { font-size: 0.83em; }
+big { font-size: 1.17em; }
+sub { vertical-align: sub; font-size: 0.83em; }
+sup { vertical-align: super; font-size: 0.83em; }
+a { color: #0000ee; text-decoration: underline; }
+a:visited { color: #551a8b; }
+hr { border: 0; border-top: 1px solid #999; margin: 0.5em 0; }
+table { border-collapse: separate; border-spacing: 2px; }
+th { font-weight: bold; text-align: center; }
+th, td { padding: 1px; vertical-align: middle; }
+img { display: inline-block; }
+input, textarea, select, button { display: inline-block; font-size: 13.33px; }
+button { padding: 1px 6px; border: 1px solid #767676; background-color: #efefef; }
+input { border: 1px solid #767676; padding: 1px 2px; }
+textarea { border: 1px solid #767676; padding: 2px; }
+fieldset { border: 1px solid #c0c0c0; padding: 0.35em 0.75em 0.625em; margin: 0 2px; }
+legend { padding: 0 2px; }
+center { display: block; text-align: center; }
+mark { background-color: yellow; color: black; }
+"""
