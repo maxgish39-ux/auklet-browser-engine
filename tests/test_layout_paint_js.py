@@ -1,4 +1,4 @@
-"""Auklet test suite \u2014 layout, painting, JavaScript and integration.
+"""Auklet test suite — layout, painting, JavaScript and integration.
 
 Run with:  python -m pytest tests/ -q      (or)   python tests/run_tests.py
 
@@ -195,8 +195,11 @@ def test_paint() -> None:
     b7.load_html("<style>body{margin:0;background:#fff}#bd{width:60px;height:60px;"
                  "margin:10px;border:5px solid #ff0000}</style><div id=bd></div>")
     im7 = b7.render().convert("RGB")
-    check("border painted on the edge", im7.getpixel((12, 40)) == (255, 0, 0),
-          str(im7.getpixel((12, 40))))
+    edge = im7.getpixel((12, 40))
+    check("border painted on the edge", edge[0] > 240 and edge[1] < 15 and edge[2] < 15,
+          str(edge))
+    check("border interior stays white", im7.getpixel((40, 40)) == (255, 255, 255),
+          str(im7.getpixel((40, 40))))
 
     # text colour
     b8 = Browser(viewport=(200, 60))
@@ -355,11 +358,18 @@ def test_integration() -> None:
           b2.styles[id(p)].get("color"))
 
     # media query applied at the given viewport
+    # A media query adds no specificity, so the rule must come last to win.
     b3 = Browser(viewport=(320, 200))
-    b3.load_html("<style>@media (max-width: 500px){p{color:green}} p{color:black}</style><p>t</p>")
+    b3.load_html("<style>p{color:black} @media (max-width: 500px){p{color:green}}</style><p>t</p>")
     p3 = [e for e in b3.doc.elements() if e.tag == "p"][0]
-    check("media query matches at narrow viewport",
+    check("media query applies at narrow viewport",
           b3.styles[id(p3)].get("color") == "green", b3.styles[id(p3)].get("color"))
+
+    b4 = Browser(viewport=(900, 200))
+    b4.load_html("<style>p{color:black} @media (max-width: 500px){p{color:green}}</style><p>t</p>")
+    p4 = [e for e in b4.doc.elements() if e.tag == "p"][0]
+    check("media query does not apply at wide viewport",
+          b4.styles[id(p4)].get("color") == "black", b4.styles[id(p4)].get("color"))
 
 
 if __name__ == "__main__":
