@@ -166,26 +166,26 @@ Stated plainly so nothing here is overclaimed:
 
 | File | Lines | Responsibility |
 |---|---:|---|
-| `auklet/dom.py` | ~300 | Node/Element/Text/Document, tree mutation, serialisation |
-| `auklet/html_parser.py` | ~430 | Tokenizer + tree builder |
-| `auklet/css.py` | ~1250 | Selectors, cascade, computed styles, UA sheet |
-| `auklet/fonts.py` | ~120 | Font-stack resolution and cached text measurement |
-| `auklet/layout.py` | ~1100 | Box tree, block/inline/flex/table layout, positioning |
-| `auklet/paint.py` | ~560 | Rasterisation of backgrounds, borders, text, images |
-| `auklet/js_runtime.py` | ~800 | QuickJS context and the DOM bridge |
-| `auklet/browser.py` | ~330 | Pipeline orchestration, resources, interaction |
-| `auklet/cli.py` | ~90 | Command-line renderer |
+| `auklet/dom.py` | ~260 | Node/Element/Text/Document, tree mutation, serialisation |
+| `auklet/html_parser.py` | ~440 | Tokenizer + tree builder |
+| `auklet/css.py` | ~1230 | Selectors, cascade, computed styles, UA sheet |
+| `auklet/fonts.py` | ~90 | Font-stack resolution and cached text measurement |
+| `auklet/layout.py` | ~1080 | Box tree, block/inline/flex/table layout, positioning |
+| `auklet/paint.py` | ~550 | Rasterisation of backgrounds, borders, text, images |
+| `auklet/js_runtime.py` | ~900 | QuickJS context and the DOM bridge |
+| `auklet/browser.py` | ~350 | Pipeline orchestration, resources, interaction |
+| `auklet/cli.py` | ~55 | Command-line renderer |
 
 ## Tests
 
-`tests/run_tests.py` is a dependency-free suite of **78 assertions** across
+`tests/run_tests.py` is a dependency-free suite of **99 assertions** across
 parsing, selectors, the cascade, box geometry, flexbox, tables, painting and
 JavaScript. It asserts real numbers (box widths, pixel colours, line counts)
 rather than smoke-testing.
 
 ```bash
 python tests/run_tests.py
-# 78 passed, 0 failed
+# 99 passed, 0 failed
 # ALL TESTS PASSED
 ```
 
@@ -194,6 +194,7 @@ python tests/run_tests.py
 - Python 3.9+
 - `Pillow` (rasterisation and font metrics)
 - `quickjs` (the JavaScript engine)
+- `numpy` (fast gradient rasterisation)
 - A system font (DejaVu, Liberation or FreeFont — present on most Linux images)
 
 ## License
