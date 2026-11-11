@@ -35,7 +35,6 @@ class Painter:
     # -- public --------------------------------------------------------
     def render(self) -> Image.Image:
         w, h = int(self.viewport[0]), int(self.viewport[1])
-        # document height may exceed the viewport
         doc_h = max(h, int(math.ceil(self.root.h)))
         img = Image.new("RGBA", (w * SS, doc_h * SS), self.background)
         draw = ImageDraw.Draw(img, "RGBA")
@@ -47,7 +46,7 @@ class Painter:
     def _s(self, v: float) -> float:
         return v * SS
 
-    def _rect(self, box: Box) -> tuple[float, float, float, float]:
+    def _rect(self, box: Box):
         return (self._s(box.x), self._s(box.y),
                 self._s(box.x + box.w), self._s(box.y + box.h))
 
@@ -61,26 +60,19 @@ class Painter:
         if op <= 0.001:
             return
 
-        # box-shadow behind the box
         self._paint_shadow(img, draw, box, op)
-
-        # background
         self._paint_background(img, draw, box, op)
-
-        # borders
         self._paint_borders(img, draw, box, op)
 
-        # content
         if box.kind == "image":
             self._paint_image(img, draw, box, op)
         elif box.kind == "text":
-            pass  # text is painted by the inline formatter
+            pass
         elif box.lines:
             self._paint_lines(img, draw, box, op)
         elif box.kind == "list-item":
             self._paint_marker(img, draw, box, op)
 
-        # children in paint order
         positioned = []
         normal = []
         for c in box.children:
@@ -104,20 +96,18 @@ class Painter:
         radius = self._radius(box)
         if color[3] > 0:
             fill = _with_alpha(color, op)
-            if fill[3] < 255:
-                # composite so translucent fills blend with what is behind
-                x0, y0, x1, y1 = self._rect(box)
-                bw, bh = int(x1 - x0), int(y1 - y0)
-                if bw > 0 and bh > 0:
-                    layer = Image.new("RGBA", (bw, bh), fill)
-                    if radius > 0:
-                        mask = Image.new("L", (bw, bh), 0)
-                        md = ImageDraw.Draw(mask)
-                        r = min(self._s(radius), bw / 2, bh / 2)
-                        md.rounded_rectangle([0, 0, bw - 1, bh - 1], radius=r, fill=255)
-                        layer.putalpha(Image.composite(layer.getchannel("A"),
-                                                       Image.new("L", (bw, bh), 0), mask))
-                    img.alpha_composite(layer, (int(x0), int(y0)))
+            x0, y0, x1, y1 = self._rect(box)
+            bw, bh = int(x1 - x0), int(y1 - y0)
+            if fill[3] < 255 and bw > 0 and bh > 0:
+                layer = Image.new("RGBA", (bw, bh), fill)
+                if radius > 0:
+                    mask = Image.new("L", (bw, bh), 0)
+                    md = ImageDraw.Draw(mask)
+                    r = min(self._s(radius), bw / 2, bh / 2)
+                    md.rounded_rectangle([0, 0, bw - 1, bh - 1], radius=r, fill=255)
+                    layer.putalpha(Image.composite(layer.getchannel("A"),
+                                                   Image.new("L", (bw, bh), 0), mask))
+                img.alpha_composite(layer, (int(x0), int(y0)))
             elif radius > 0:
                 self._rounded_rect(img, draw, box, fill, radius)
             else:
@@ -141,10 +131,7 @@ class Painter:
         bh = max(1, int(self._s(box.h)))
         if size in ("cover", "contain"):
             sw, sh = src.size
-            if size == "cover":
-                scale = max(bw / sw, bh / sh)
-            else:
-                scale = min(bw / sw, bh / sh)
+            scale = max(bw / sw, bh / sh) if size == "cover" else min(bw / sw, bh / sh)
             nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
             resized = src.resize((nw, nh), Image.LANCZOS)
             layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
@@ -152,8 +139,7 @@ class Painter:
         else:
             layer = src.resize((bw, bh), Image.LANCZOS)
         if op < 1.0:
-            a = layer.getchannel("A").point(lambda v: int(v * op))
-            layer.putalpha(a)
+            layer.putalpha(layer.getchannel("A").point(lambda v: int(v * op)))
         if radius > 0:
             mask = Image.new("L", (bw, bh), 0)
             md = ImageDraw.Draw(mask)
@@ -166,8 +152,7 @@ class Painter:
         m = re.search(r"linear-gradient\((.*)\)", value, re.S)
         if not m:
             return
-        body = m.group(1)
-        parts = _split_commas(body)
+        parts = _split_commas(m.group(1))
         angle = 180.0
         if parts and ("deg" in parts[0] or parts[0].strip().startswith("to ")):
             head = parts[0].strip()
@@ -200,20 +185,7 @@ class Painter:
                 stops[i] = (c, i / (len(stops) - 1))
         bw = max(1, int(self._s(box.w)))
         bh = max(1, int(self._s(box.h)))
-        layer = Image.new("RGBA", (bw, bh))
-        px = layer.load()
-        rad = math.radians(angle)
-        dx, dy = math.sin(rad), -math.cos(rad)
-        # projection range
-        corners = [(0, 0), (bw, 0), (0, bh), (bw, bh)]
-        projs = [x * dx + y * dy for x, y in corners]
-        pmin, pmax = min(projs), max(projs)
-        span = max(1e-6, pmax - pmin)
-        for y in range(bh):
-            for x in range(bw):
-                t = ((x * dx + y * dy) - pmin) / span
-                col = _gradient_at(stops, t)
-                px[x, y] = (col[0], col[1], col[2], int(col[3] * op))
+        layer = _render_gradient(bw, bh, angle, stops, op)
         if radius > 0:
             mask = Image.new("L", (bw, bh), 0)
             md = ImageDraw.Draw(mask)
@@ -244,7 +216,6 @@ class Painter:
             return
         radius = self._radius(box)
         if radius > 0 and len(sides) == 4:
-            # draw a rounded ring
             w = max(s[1] for s in sides)
             col = sides[0][3]
             x0, y0, x1, y1 = self._rect(box)
@@ -289,10 +260,10 @@ class Painter:
         spread = float(spread or 0)
         bw = max(1, int(self._s(box.w + spread * 2)))
         bh = max(1, int(self._s(box.h + spread * 2)))
+        pad = 20
         layer = Image.new("RGBA", (bw + int(self._s(abs(ox))) * 2 + 40,
                                    bh + int(self._s(abs(oy))) * 2 + 40), (0, 0, 0, 0))
         ld = ImageDraw.Draw(layer)
-        pad = 20
         ld.rectangle([pad, pad, pad + bw, pad + bh], fill=_with_alpha(col, op))
         if blur > 0:
             layer = layer.filter(ImageFilter.GaussianBlur(self._s(blur) / 2))
@@ -307,9 +278,6 @@ class Painter:
                     self._paint_text_item(img, draw, box, line, it, op)
                 elif it.kind in ("inline-block", "image") and it.box is not None:
                     self._paint_box(img, draw, it.box, op)
-                elif it.kind == "br":
-                    continue
-            # text-decoration for inline chains
             self._paint_decorations(img, draw, box, line, op)
 
     def _paint_text_item(self, img, draw, box: Box, line: Line, it, op: float) -> None:
@@ -320,8 +288,7 @@ class Painter:
         path = it.font_path or resolve_font_file(st.font_families(), st.is_bold(),
                                                  st.get("font-style") == "italic")
         font = get_font(path, max(1, int(round(fs * SS))))
-        col = st.color("color")
-        fill = _with_alpha(col, op)
+        fill = _with_alpha(st.color("color"), op)
         x = self._s(box.content_x + it.x)
         y = self._s(box.content_y + line.y + (line.baseline - it.baseline))
         text = it.text
@@ -338,7 +305,6 @@ class Painter:
             pass
 
     def _paint_decorations(self, img, draw, box: Box, line: Line, op: float) -> None:
-        # underline / line-through per inline chain
         for it in line.items:
             if it.kind != "text" or not it.text.strip():
                 continue
@@ -366,23 +332,15 @@ class Painter:
             return
         im = self._load_image(src)
         if im is None:
-            # broken image placeholder
             x0, y0, x1, y1 = self._rect(box)
             draw.rectangle([x0, y0, x1, y1], outline=(180, 180, 180, 255))
             return
         bw = max(1, int(self._s(box.content_w)))
         bh = max(1, int(self._s(box.content_h)))
         fit = box.style.get("object-fit", "fill")
-        if fit == "cover":
+        if fit in ("cover", "contain"):
             sw, sh = im.size
-            scale = max(bw / sw, bh / sh)
-            nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
-            resized = im.resize((nw, nh), Image.LANCZOS)
-            layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
-            layer.paste(resized, ((bw - nw) // 2, (bh - nh) // 2), resized)
-        elif fit == "contain":
-            sw, sh = im.size
-            scale = min(bw / sw, bh / sh)
+            scale = max(bw / sw, bh / sh) if fit == "cover" else min(bw / sw, bh / sh)
             nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
             resized = im.resize((nw, nh), Image.LANCZOS)
             layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
@@ -390,8 +348,7 @@ class Painter:
         else:
             layer = im.resize((bw, bh), Image.LANCZOS)
         if op < 1.0:
-            a = layer.getchannel("A").point(lambda v: int(v * op))
-            layer.putalpha(a)
+            layer.putalpha(layer.getchannel("A").point(lambda v: int(v * op)))
         radius = self._radius(box)
         if radius > 0:
             mask = Image.new("L", (bw, bh), 0)
@@ -468,6 +425,30 @@ class Painter:
             draw.text((cx - tw, self._s(box.y + fs * 0.15)), label, font=font, fill=col)
 
 
+def _render_gradient(bw: int, bh: int, angle: float, stops, op: float) -> Image.Image:
+    """Rasterise a linear gradient with numpy (whole-plane, so it stays fast)."""
+    import numpy as np
+
+    rad = math.radians(angle)
+    dx, dy = math.sin(rad), -math.cos(rad)
+    xs = np.arange(bw, dtype=np.float32)
+    ys = np.arange(bh, dtype=np.float32)
+    proj = (xs[None, :] * dx) + (ys[:, None] * dy)
+    corners = [0.0, bw * dx, bh * dy, bw * dx + bh * dy]
+    pmin, pmax = min(corners), max(corners)
+    span = max(1e-6, pmax - pmin)
+    t = np.clip((proj - pmin) / span, 0.0, 1.0)
+
+    positions = np.array([p for _, p in stops], dtype=np.float32)
+    colors = np.array([[c[0], c[1], c[2], c[3]] for c, _ in stops], dtype=np.float32)
+    out = np.empty((bh, bw, 4), dtype=np.float32)
+    for ch in range(4):
+        out[:, :, ch] = np.interp(t, positions, colors[:, ch])
+    out[:, :, 3] *= float(op)
+    arr = np.clip(out, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -516,19 +497,6 @@ def _split_commas(s: str) -> list[str]:
             cur.append(ch)
     out.append("".join(cur))
     return out
-
-
-def _gradient_at(stops, t: float):
-    t = max(0.0, min(1.0, t))
-    for i in range(len(stops) - 1):
-        c0, p0 = stops[i]
-        c1, p1 = stops[i + 1]
-        if p0 <= t <= p1 or i == len(stops) - 2:
-            span = max(1e-6, p1 - p0)
-            f = (t - p0) / span
-            f = max(0.0, min(1.0, f))
-            return tuple(int(c0[k] + (c1[k] - c0[k]) * f) for k in range(4))
-    return stops[-1][0]
 
 
 def _roman(n: int) -> str:
