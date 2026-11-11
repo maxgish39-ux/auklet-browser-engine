@@ -1,0 +1,56 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Auklet JS demo</title>
+<style>
+  body { margin: 0; font-family: sans-serif; background: #0f172a; color: #e2e8f0; padding: 40px; }
+  h1 { font-size: 30px; margin: 0 0 6px; }
+  .sub { color: #94a3b8; margin: 0 0 28px; }
+  .row { display: flex; gap: 16px; margin-bottom: 24px; }
+  .stat { flex: 1; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 18px; }
+  .stat .n { font-size: 34px; font-weight: bold; color: #38bdf8; }
+  .stat .l { font-size: 13px; color: #94a3b8; margin-top: 4px; }
+  button { padding: 10px 18px; border-radius: 8px; border: 1px solid #475569;
+           background: #334155; color: #e2e8f0; font-size: 14px; margin-right: 10px; }
+  #log { margin-top: 20px; background: #020617; border: 1px solid #1e293b; border-radius: 10px;
+         padding: 16px; font-family: monospace; font-size: 13px; color: #7dd3fc; line-height: 1.7; }
+</style></head>
+<body>
+  <h1>Auklet JavaScript runtime</h1>
+  <p class="sub">This page is driven entirely by the embedded QuickJS engine.</p>
+  <div class="row">
+    <div class="stat"><div class="n" id="count">0</div><div class="l">clicks handled</div></div>
+    <div class="stat"><div class="n" id="fib">-</div><div class="l">fib(20) computed in JS</div></div>
+    <div class="stat"><div class="n" id="items">0</div><div class="l">DOM nodes created</div></div>
+  </div>
+  <button id="inc">Increment</button>
+  <button id="add">Add a row</button>
+  <div id="log">ready</div>
+  <script>
+    var clicks = 0, made = 0;
+    function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+    document.getElementById("fib").textContent = String(fib(20));
+
+    function log(msg) {
+      var el = document.getElementById("log");
+      el.textContent = el.textContent + "\n" + msg;
+    }
+
+    document.getElementById("inc").addEventListener("click", function () {
+      clicks += 1;
+      document.getElementById("count").textContent = String(clicks);
+      log("click #" + clicks);
+    });
+
+    document.getElementById("add").addEventListener("click", function () {
+      var d = document.createElement("div");
+      d.className = "stat";
+      d.textContent = "row " + (made + 1);
+      document.body.appendChild(d);
+      made += 1;
+      document.getElementById("items").textContent = String(made);
+      log("created node " + made);
+    });
+
+    setTimeout(function () { log("timer fired after 50ms"); }, 50);
+    log("script executed");
+  </script>
+</body></html>
