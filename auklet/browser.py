@@ -150,6 +150,10 @@ class Browser:
         self.stats.parse_ms = (time.perf_counter() - t0) * 1000
         self.stats.nodes = sum(1 for _ in self.doc.walk())
         self._collect_stylesheets()
+        # Style and lay out once before scripts run, so that geometry queries
+        # (offsetWidth, getBoundingClientRect) answer from a real layout, the
+        # way a browser forces layout on demand.
+        self.relayout()
         self._run_scripts()
         self.relayout()
         self.paint()
