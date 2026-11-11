@@ -978,7 +978,8 @@ def _layout_table(box: Box, width: float, ctx: LayoutContext) -> float:
                 h = _layout_block_children(cell, cell.content_w, ctx)
             cell.content_h = h
             cell.h = h + cell.pt + cell.pb + cell.bt + cell.bb
-            _shift(cell, box.content_x + x, box.content_y + y)
+            # cells are positioned in row-local space; the row is moved once
+            _shift(cell, x, 0.0)
             row_h = max(row_h, cell.h)
             x += cw + spacing
         # stretch cells to row height
