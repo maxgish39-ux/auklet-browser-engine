@@ -4,7 +4,7 @@ A real ECMAScript engine (QuickJS) is embedded and given a DOM binding layer:
 ``document``, ``window``, element wrappers with ``querySelector``,
 ``createElement``, ``classList``, ``style``, ``addEventListener``, timers and
 ``console``.  Scripts run to completion, then the engine re-styles, re-lays out
-and re-paints \u2014 so JS-driven pages actually change what is on screen.
+and re-paints — so JS-driven pages actually change what is on screen.
 """
 
 from __future__ import annotations
@@ -38,7 +38,20 @@ PRELUDE = r"""
   };
   Object.defineProperty(NodeList.prototype, "0", { get: function(){ return this._items[0]; } });
 
-  function makeList(arr){ return new NodeList(arr); }
+  function __kids(h){ return JSON.parse(__children(h)); }
+  function __nodes(h){ return JSON.parse(__childNodes(h)); }
+  function __attrs(h){ return JSON.parse(__attrNames(h)); }
+  function __qsa(h, s){ return JSON.parse(__querySelectorAll(h, s)); }
+  function __byTag(h, t){ return JSON.parse(__getElementsByTagName(h, t)); }
+  function __byClass(h, c){ return JSON.parse(__getElementsByClassName(h, c)); }
+
+  function makeList(arr){
+    var list = new NodeList(arr);
+    for (var i = 0; i < list._items.length; i++) {
+      Object.defineProperty(list, i, { value: list._items[i], enumerable: true });
+    }
+    return list;
+  }
 
   function Style(el){
     this._el = el;
@@ -132,7 +145,7 @@ PRELUDE = r"""
   Object.defineProperty(EP, "dataset", {
     get: function(){
       var self = this, out = {};
-      var names = __attrNames(this.__h);
+      var names = __attrs(this.__h);
       names.forEach(function(n){
         if (n.indexOf("data-") === 0) {
           var key = n.slice(5).replace(/-([a-z])/g, function(m,c){ return c.toUpperCase(); });
@@ -143,17 +156,17 @@ PRELUDE = r"""
     }
   });
   Object.defineProperty(EP, "children", {
-    get: function(){ return makeList(__children(this.__h).map(wrap)); }
+    get: function(){ return makeList(__kids(this.__h).map(wrap)); }
   });
   Object.defineProperty(EP, "childNodes", {
-    get: function(){ return makeList(__childNodes(this.__h).map(wrap)); }
+    get: function(){ return makeList(__nodes(this.__h).map(wrap)); }
   });
   Object.defineProperty(EP, "parentNode", { get: function(){ return wrap(__parent(this.__h)); } });
   Object.defineProperty(EP, "parentElement", { get: function(){ return wrap(__parent(this.__h)); } });
-  Object.defineProperty(EP, "firstChild", { get: function(){ var c=__childNodes(this.__h); return c.length?wrap(c[0]):null; } });
-  Object.defineProperty(EP, "lastChild", { get: function(){ var c=__childNodes(this.__h); return c.length?wrap(c[c.length-1]):null; } });
-  Object.defineProperty(EP, "firstElementChild", { get: function(){ var c=__children(this.__h); return c.length?wrap(c[0]):null; } });
-  Object.defineProperty(EP, "lastElementChild", { get: function(){ var c=__children(this.__h); return c.length?wrap(c[c.length-1]):null; } });
+  Object.defineProperty(EP, "firstChild", { get: function(){ var c=__nodes(this.__h); return c.length?wrap(c[0]):null; } });
+  Object.defineProperty(EP, "lastChild", { get: function(){ var c=__nodes(this.__h); return c.length?wrap(c[c.length-1]):null; } });
+  Object.defineProperty(EP, "firstElementChild", { get: function(){ var c=__kids(this.__h); return c.length?wrap(c[0]):null; } });
+  Object.defineProperty(EP, "lastElementChild", { get: function(){ var c=__kids(this.__h); return c.length?wrap(c[c.length-1]):null; } });
   Object.defineProperty(EP, "nextSibling", { get: function(){ return wrap(__nextSibling(this.__h)); } });
   Object.defineProperty(EP, "previousSibling", { get: function(){ return wrap(__prevSibling(this.__h)); } });
   Object.defineProperty(EP, "nextElementSibling", { get: function(){ return wrap(__nextElement(this.__h)); } });
@@ -198,7 +211,7 @@ PRELUDE = r"""
   EP.setAttribute = function(n, v){ __setAttr(this.__h, String(n).toLowerCase(), String(v)); };
   EP.removeAttribute = function(n){ __removeAttr(this.__h, String(n).toLowerCase()); };
   EP.hasAttribute = function(n){ return __hasAttr(this.__h, String(n).toLowerCase()); };
-  EP.getAttributeNames = function(){ return __attrNames(this.__h); };
+  EP.getAttributeNames = function(){ return __attrs(this.__h); };
   EP.appendChild = function(child){ if(!child) return child; __appendChild(this.__h, child.__h); return child; };
   EP.append = function(){ for(var i=0;i<arguments.length;i++){ var a=arguments[i]; if(typeof a==="string"){ __appendText(this.__h, a); } else if(a && a.__h!==undefined){ __appendChild(this.__h, a.__h); } } };
   EP.prepend = function(){ for(var i=arguments.length-1;i>=0;i--){ var a=arguments[i]; if(typeof a==="string"){ __prependText(this.__h, a); } else if(a && a.__h!==undefined){ __prependChild(this.__h, a.__h); } } };
@@ -209,9 +222,9 @@ PRELUDE = r"""
   EP.cloneNode = function(deep){ return wrap(__cloneNode(this.__h, !!deep)); };
   EP.contains = function(other){ return other && other.__h !== undefined ? __contains(this.__h, other.__h) : false; };
   EP.querySelector = function(sel){ return wrap(__querySelector(this.__h, String(sel))); };
-  EP.querySelectorAll = function(sel){ return makeList(__querySelectorAll(this.__h, String(sel)).map(wrap)); };
-  EP.getElementsByTagName = function(t){ return makeList(__getElementsByTagName(this.__h, String(t)).map(wrap)); };
-  EP.getElementsByClassName = function(c){ return makeList(__getElementsByClassName(this.__h, String(c)).map(wrap)); };
+  EP.querySelectorAll = function(sel){ return makeList(__qsa(this.__h, String(sel)).map(wrap)); };
+  EP.getElementsByTagName = function(t){ return makeList(__byTag(this.__h, String(t)).map(wrap)); };
+  EP.getElementsByClassName = function(c){ return makeList(__byClass(this.__h, String(c)).map(wrap)); };
   EP.closest = function(sel){ return wrap(__closest(this.__h, String(sel))); };
   EP.matches = function(sel){ return __matches(this.__h, String(sel)); };
   EP.addEventListener = function(type, fn, opts){ __addEventListener(this.__h, String(type), fn, opts); };
@@ -238,9 +251,9 @@ PRELUDE = r"""
     get readyState(){ return "complete"; },
     getElementById: function(id){ return wrap(__getElementById(String(id))); },
     querySelector: function(sel){ return wrap(__querySelector(this.__h, String(sel))); },
-    querySelectorAll: function(sel){ return makeList(__querySelectorAll(this.__h, String(sel)).map(wrap)); },
-    getElementsByTagName: function(t){ return makeList(__getElementsByTagName(this.__h, String(t)).map(wrap)); },
-    getElementsByClassName: function(c){ return makeList(__getElementsByClassName(this.__h, String(c)).map(wrap)); },
+    querySelectorAll: function(sel){ return makeList(__qsa(this.__h, String(sel)).map(wrap)); },
+    getElementsByTagName: function(t){ return makeList(__byTag(this.__h, String(t)).map(wrap)); },
+    getElementsByClassName: function(c){ return makeList(__byClass(this.__h, String(c)).map(wrap)); },
     createElement: function(tag){ return wrap(__createElement(String(tag))); },
     createTextNode: function(t){ return wrap(__createTextNode(String(t))); },
     createComment: function(t){ return wrap(__createComment(String(t))); },
@@ -251,8 +264,8 @@ PRELUDE = r"""
     get cookie(){ return ""; },
     set cookie(v){}
   };
-  Object.defineProperty(document, "children", { get: function(){ return makeList(__children(this.__h).map(wrap)); } });
-  Object.defineProperty(document, "childNodes", { get: function(){ return makeList(__childNodes(this.__h).map(wrap)); } });
+  Object.defineProperty(document, "children", { get: function(){ return makeList(__kids(this.__h).map(wrap)); } });
+  Object.defineProperty(document, "childNodes", { get: function(){ return makeList(__nodes(this.__h).map(wrap)); } });
 
   global.document = document;
   global.NodeList = NodeList;
@@ -335,7 +348,7 @@ class JSRuntime:
         ctx.add_callable("__setAttr", lambda h, n, v: _set_attr(rt, rt.node(h), n, v))
         ctx.add_callable("__removeAttr", lambda h, n: _remove_attr(rt, rt.node(h), n))
         ctx.add_callable("__hasAttr", lambda h, n: _has_attr(rt.node(h), n))
-        ctx.add_callable("__attrNames", lambda h: _attr_names(rt.node(h)))
+        ctx.add_callable("__attrNames", lambda h: json.dumps(_attr_names(rt.node(h))))
         ctx.add_callable("__getText", lambda h: getattr(rt.node(h), "data", ""))
         ctx.add_callable("__setText", lambda h, v: _set_text(rt, rt.node(h), v))
         ctx.add_callable("__textContent", lambda h: _text_content(rt.node(h)))
@@ -343,8 +356,8 @@ class JSRuntime:
         ctx.add_callable("__innerHTML", lambda h: _inner_html(rt.node(h)))
         ctx.add_callable("__setInnerHTML", lambda h, v: _set_inner_html(rt, rt.node(h), v))
         ctx.add_callable("__outerHTML", lambda h: _outer_html(rt.node(h)))
-        ctx.add_callable("__children", lambda h: [rt.handle(c) for c in _children(rt.node(h))])
-        ctx.add_callable("__childNodes", lambda h: [rt.handle(c) for c in _child_nodes(rt.node(h))])
+        ctx.add_callable("__children", lambda h: json.dumps([rt.handle(c) for c in _children(rt.node(h))]))
+        ctx.add_callable("__childNodes", lambda h: json.dumps([rt.handle(c) for c in _child_nodes(rt.node(h))]))
         ctx.add_callable("__parent", lambda h: rt.handle(_parent(rt.node(h))))
         ctx.add_callable("__nextSibling", lambda h: rt.handle(_sibling(rt.node(h), 1)))
         ctx.add_callable("__prevSibling", lambda h: rt.handle(_sibling(rt.node(h), -1)))
@@ -372,9 +385,9 @@ class JSRuntime:
 
         # --- queries
         ctx.add_callable("__querySelector", lambda h, s: rt.handle(_query_one(rt.node(h), s)))
-        ctx.add_callable("__querySelectorAll", lambda h, s: [rt.handle(n) for n in _query_all(rt.node(h), s)])
-        ctx.add_callable("__getElementsByTagName", lambda h, t: [rt.handle(n) for n in _by_tag(rt.node(h), t)])
-        ctx.add_callable("__getElementsByClassName", lambda h, c: [rt.handle(n) for n in _by_class(rt.node(h), c)])
+        ctx.add_callable("__querySelectorAll", lambda h, s: json.dumps([rt.handle(n) for n in _query_all(rt.node(h), s)]))
+        ctx.add_callable("__getElementsByTagName", lambda h, t: json.dumps([rt.handle(n) for n in _by_tag(rt.node(h), t)]))
+        ctx.add_callable("__getElementsByClassName", lambda h, c: json.dumps([rt.handle(n) for n in _by_class(rt.node(h), c)]))
         ctx.add_callable("__closest", lambda h, s: rt.handle(_closest(rt.node(h), s)))
         ctx.add_callable("__matches", lambda h, s: _matches(rt.node(h), s))
 
