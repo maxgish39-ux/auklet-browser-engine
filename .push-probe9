@@ -1,0 +1,6 @@
+"""Auklet UI.
+
+Run it with::
+
+    python -m auklet.ui https://example.com
+"""
