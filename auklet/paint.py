@@ -24,31 +24,64 @@ SS = 2  # supersample factor
 
 class Painter:
     def __init__(self, root: Box, viewport=(1280, 800), base_url: str = "",
-                 image_loader=None, background=(255, 255, 255, 255)):
+                 image_loader=None, background=(255, 255, 255, 255),
+                 paint_rect=None, scale: int = SS, max_height: int = 20000):
         self.root = root
         self.viewport = viewport
         self.base_url = base_url
         self.image_loader = image_loader
         self.background = background
         self._img_cache: dict[str, Optional[Image.Image]] = {}
+        # Optional clip in document coordinates (x0, y0, x1, y1).  Content
+        # outside it is skipped, which is how the browser UI renders only the
+        # visible slice of a tall page.
+        self.paint_rect = paint_rect
+        self.scale = max(1, int(scale))
+        # Hard cap on a full-document raster, in document pixels.  A page can
+        # legitimately be 30 000px tall; rasterising that at 2x is ~650MB.
+        self.max_height = max(1, int(max_height))
+        self._clip = None
 
     # -- public --------------------------------------------------------
     def render(self) -> Image.Image:
+        ss = self.scale
         w, h = int(self.viewport[0]), int(self.viewport[1])
+        origin_x = origin_y = 0.0
+        if self.paint_rect is not None:
+            origin_x, origin_y = float(self.paint_rect[0]), float(self.paint_rect[1])
+        # Surface height in document pixels: the whole page by default, or just
+        # the requested slice when a paint rect was supplied.
         doc_h = max(h, int(math.ceil(self.root.h)))
-        img = Image.new("RGBA", (w * SS, doc_h * SS), self.background)
+        canvas_h = h if self.paint_rect is not None else max(h, doc_h)
+        canvas_h = min(canvas_h, self.max_height)
+        out_h = canvas_h
+        img = Image.new("RGBA", (max(1, w * ss), max(1, canvas_h * ss)), self.background)
         draw = ImageDraw.Draw(img, "RGBA")
+        self._origin = (origin_x, origin_y)
+        if self.paint_rect is not None:
+            self._clip = (float(self.paint_rect[0]), float(self.paint_rect[1]),
+                          float(self.paint_rect[2]), float(self.paint_rect[3]))
         self._paint_box(img, draw, self.root, 1.0)
-        out = img.resize((w, doc_h), Image.LANCZOS)
-        return out
+        if ss != 1:
+            return img.resize((max(1, w), max(1, out_h)), Image.LANCZOS)
+        return img
 
     # -- helpers -------------------------------------------------------
     def _s(self, v: float) -> float:
-        return v * SS
+        """Scale a *length* (no origin subtraction): widths, radii, font sizes."""
+        return v * self.scale
+
+    def _px(self, x: float) -> float:
+        """Map a document x coordinate into device pixels."""
+        return (x - self._origin[0]) * self.scale
+
+    def _py(self, y: float) -> float:
+        """Map a document y coordinate into device pixels."""
+        return (y - self._origin[1]) * self.scale
 
     def _rect(self, box: Box):
-        return (self._s(box.x), self._s(box.y),
-                self._s(box.x + box.w), self._s(box.y + box.h))
+        return (self._px(box.x), self._py(box.y),
+                self._px(box.x + box.w), self._py(box.y + box.h))
 
     def _paint_box(self, img, draw, box: Box, opacity: float) -> None:
         st = box.style
@@ -59,6 +92,15 @@ class Painter:
         op = opacity * _num(st.get("opacity", "1"), 1.0)
         if op <= 0.001:
             return
+        # Cull subtrees that fall entirely outside the clip rect.  Boxes with
+        # no children and no ink are cheap regardless, so only prune when the
+        # whole subtree is off-screen.
+        if self._clip is not None and box.children:
+            cx0, cy0, cx1, cy1 = self._clip
+            if box.x > cx1 or box.y > cy1:
+                return
+            if box.x + box.w < cx0 and box.y + box.h < cy0:
+                return
 
         self._paint_shadow(img, draw, box, op)
         self._paint_background(img, draw, box, op)
@@ -145,7 +187,7 @@ class Painter:
             md = ImageDraw.Draw(mask)
             md.rounded_rectangle([0, 0, bw - 1, bh - 1], radius=self._s(radius), fill=255)
             layer.putalpha(Image.composite(layer.getchannel("A"), Image.new("L", (bw, bh), 0), mask))
-        img.alpha_composite(layer, (int(self._s(box.x)), int(self._s(box.y))))
+        img.alpha_composite(layer, (int(self._px(box.x)), int(self._py(box.y))))
 
     def _paint_gradient(self, img, box: Box, value: str, op: float, radius: float) -> None:
         import re
@@ -191,7 +233,7 @@ class Painter:
             md = ImageDraw.Draw(mask)
             md.rounded_rectangle([0, 0, bw - 1, bh - 1], radius=self._s(radius), fill=255)
             layer.putalpha(Image.composite(layer.getchannel("A"), Image.new("L", (bw, bh), 0), mask))
-        img.alpha_composite(layer, (int(self._s(box.x)), int(self._s(box.y))))
+        img.alpha_composite(layer, (int(self._px(box.x)), int(self._py(box.y))))
 
     # -- borders -------------------------------------------------------
     def _radius(self, box: Box) -> float:
@@ -267,8 +309,8 @@ class Painter:
         ld.rectangle([pad, pad, pad + bw, pad + bh], fill=_with_alpha(col, op))
         if blur > 0:
             layer = layer.filter(ImageFilter.GaussianBlur(self._s(blur) / 2))
-        img.alpha_composite(layer, (int(self._s(box.x - spread + ox)) - pad,
-                                    int(self._s(box.y - spread + oy)) - pad))
+        img.alpha_composite(layer, (int(self._px(box.x - spread + ox)) - pad,
+                                    int(self._py(box.y - spread + oy)) - pad))
 
     # -- text ----------------------------------------------------------
     def _paint_lines(self, img, draw, box: Box, op: float) -> None:
@@ -287,10 +329,10 @@ class Painter:
         fs = _fs(st)
         path = it.font_path or resolve_font_file(st.font_families(), st.is_bold(),
                                                  st.get("font-style") == "italic")
-        font = get_font(path, max(1, int(round(fs * SS))))
+        font = get_font(path, max(1, int(round(fs * self.scale))))
         fill = _with_alpha(st.color("color"), op)
-        x = self._s(box.content_x + it.x)
-        y = self._s(box.content_y + line.y + (line.baseline - it.baseline))
+        x = self._px(box.content_x + it.x)
+        y = self._py(box.content_y + line.y + (line.baseline - it.baseline))
         text = it.text
         transform = st.get("text-transform", "none")
         if transform == "uppercase":
@@ -313,14 +355,14 @@ class Painter:
                 if deco in ("none", ""):
                     continue
                 col = _with_alpha(ib.style.color("color"), op)
-                x0 = self._s(box.content_x + it.x)
-                x1 = self._s(box.content_x + it.x + it.w)
-                base = self._s(box.content_y + line.y + line.baseline)
+                x0 = self._px(box.content_x + it.x)
+                x1 = self._px(box.content_x + it.x + it.w)
+                base = self._py(box.content_y + line.y + line.baseline)
                 if "underline" in deco:
-                    draw.line([(x0, base + 1), (x1, base + 1)], fill=col, width=max(1, int(SS)))
+                    draw.line([(x0, base + 1), (x1, base + 1)], fill=col, width=max(1, int(self.scale)))
                 if "line-through" in deco:
                     draw.line([(x0, base - self._s(_fs(ib.style) * 0.3)),
-                               (x1, base - self._s(_fs(ib.style) * 0.3))], fill=col, width=max(1, int(SS)))
+                               (x1, base - self._s(_fs(ib.style) * 0.3))], fill=col, width=max(1, int(self.scale)))
 
     # -- images --------------------------------------------------------
     def _paint_image(self, img, draw, box: Box, op: float) -> None:
@@ -355,7 +397,7 @@ class Painter:
             md = ImageDraw.Draw(mask)
             md.rounded_rectangle([0, 0, bw - 1, bh - 1], radius=self._s(radius), fill=255)
             layer.putalpha(Image.composite(layer.getchannel("A"), Image.new("L", (bw, bh), 0), mask))
-        img.alpha_composite(layer, (int(self._s(box.content_x)), int(self._s(box.content_y))))
+        img.alpha_composite(layer, (int(self._px(box.content_x)), int(self._py(box.content_y))))
 
     def _load_image(self, src: str) -> Optional[Image.Image]:
         if src in self._img_cache:
@@ -394,14 +436,14 @@ class Painter:
                 index = sibs.index(box) + 1
         fs = _fs(st)
         col = _with_alpha(st.color("color"), op)
-        cx = self._s(box.x - 18)
-        cy = self._s(box.y + fs * 0.55)
+        cx = self._px(box.x - 18)
+        cy = self._py(box.y + fs * 0.55)
         if kind in ("disc", "circle", "square"):
             r = self._s(fs * 0.18)
             if kind == "square":
                 draw.rectangle([cx - r, cy - r, cx + r, cy + r], fill=col)
             elif kind == "circle":
-                draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=max(1, int(SS)))
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=max(1, int(self.scale)))
             else:
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
         elif kind == "none":
@@ -420,14 +462,14 @@ class Painter:
             else:
                 label = f"{index}."
             path = resolve_font_file(st.font_families(), st.is_bold(), False)
-            font = get_font(path, max(1, int(round(fs * SS))))
-            tw = measure_text(label, path, fs) * SS
-            draw.text((cx - tw, self._s(box.y + fs * 0.15)), label, font=font, fill=col)
+            font = get_font(path, max(1, int(round(fs * self.scale))))
+            tw = measure_text(label, path, fs) * self.scale
+            draw.text((cx - tw, self._py(box.y + fs * 0.15)), label, font=font, fill=col)
 
 
 def _render_gradient(bw: int, bh: int, angle: float, stops, op: float) -> Image.Image:
     """Rasterise a linear gradient with numpy (whole-plane, so it stays fast)."""
-    import numpy as np
+    import numpy as n
 
     rad = math.radians(angle)
     dx, dy = math.sin(rad), -math.cos(rad)
