@@ -91,6 +91,12 @@ class ActionsMixin:
                     self._schedule_render()
         except queue.Empty:
             pass
+        # A worker thread may have flagged a session change; apply it here, on
+        # the Tk thread, where touching widgets is legal.
+        if self._dirty:
+            self._dirty = False
+            self._refresh_chrome()
+            self._schedule_render()
         self.root.after(60, self._drain_results)
 
     def _set_busy(self, busy: bool, message: Optional[str]) -> None:
@@ -146,8 +152,10 @@ class ActionsMixin:
     # Chrome refresh
     # ------------------------------------------------------------------
     def _on_session_change(self, _session) -> None:
-        self._refresh_chrome()
-        self._schedule_render()
+        # This fires from the worker thread that is doing the fetch, so it must
+        # not touch Tk. Record the change and let the main-thread poller pick it
+        # up; calling into Tk from here raises "main thread is not in main loop".
+        self._dirty = True
 
     def _refresh_chrome(self) -> None:
         tab = self.session.tab
