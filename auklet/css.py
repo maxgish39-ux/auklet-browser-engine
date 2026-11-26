@@ -972,40 +972,197 @@ def _initial_props() -> dict:
     return dict(INITIAL)
 
 
+_LEGACY_COLORS = {
+    "white": "#ffffff", "black": "#000000", "red": "#ff0000", "green": "#008000",
+    "blue": "#0000ff", "yellow": "#ffff00", "gray": "#808080", "grey": "#808080",
+    "silver": "#c0c0c0", "maroon": "#800000", "navy": "#000080", "olive": "#808000",
+    "purple": "#800080", "teal": "#008080", "lime": "#00ff00", "aqua": "#00ffff",
+    "cyan": "#00ffff", "fuchsia": "#ff00ff", "magenta": "#ff00ff",
+}
+
+# HTML attributes mapped onto CSS properties.  These are the "presentational
+# hints" the HTML spec requires; without them legacy markup (Hacker News uses
+# `<body bgcolor>`, `<font color>`, `<td width>`) renders unstyled.
+_TAG_FONT_SIZES = {1: "10px", 2: "13px", 3: "16px", 4: "18px", 5: "24px",
+                   6: "32px", 7: "48px"}
+
+
+def _presentational_hints(el: Element) -> list[tuple[str, str]]:
+    """Map legacy HTML attributes to CSS declarations."""
+    a = el.attributes
+    if not a:
+        return []
+    out: list[tuple[str, str]] = []
+
+    def colour(name):
+        v = (a.get(name) or "").strip()
+        if not v:
+            return None
+        low = v.lower()
+        if low in _LEGACY_COLORS:
+            return _LEGACY_COLORS[low]
+        if re.match(r"^#[0-9a-fA-F]{3,8}$", v) or re.match(r"^(rgb|hsl)a?\(", low):
+            return v
+        return None
+
+    # background
+    bg = colour("bgcolor")
+    if bg:
+        out.append(("background-color", bg))
+    # text / link colours (body & font apply to text)
+    if el.tag in ("body", "table", "tr", "td", "th", "font", "p", "div", "span"):
+        fg = colour("text")
+        if fg:
+            out.append(("color", fg))
+    # <font>
+    if el.tag == "font":
+        fg = colour("color")
+        if fg:
+            out.append(("color", fg))
+        face = (a.get("face") or "").strip()
+        if face:
+            out.append(("font-family", face))
+        size = (a.get("size") or "").strip()
+        if size:
+            try:
+                n = int(size.lstrip("+"))
+                if size.startswith("+"):
+                    n = 3 + n
+                if n in _TAG_FONT_SIZES:
+                    out.append(("font-size", _TAG_FONT_SIZES[n]))
+            except ValueError:
+                pass
+    # alignment
+    align = (a.get("align") or "").strip().lower()
+    if align in ("left", "right", "center", "justify"):
+        if el.tag == "table" and align == "center":
+            out.append(("margin-left", "auto"))
+            out.append(("margin-right", "auto"))
+        out.append(("text-align", align))
+    valign = (a.get("valign") or "").strip().lower()
+    if valign in ("top", "middle", "bottom"):
+        out.append(("vertical-align", valign))
+    # dimensions
+    for attr, prop in (("width", "width"), ("height", "height")):
+        v = (a.get(attr) or "").strip()
+        if not v:
+            continue
+        if v.endswith("%"):
+            out.append((prop, v))
+        elif v.isdigit():
+            out.append((prop, v + "px"))
+    # cell spacing / padding
+    pad = (a.get("cellpadding") or "").strip()
+    if el.tag == "table" and pad.isdigit():
+        for side in ("padding-top", "padding-right", "padding-bottom", "padding-left"):
+            out.append((side, pad + "px"))
+    # <hr>, <center>
+    if el.tag == "hr" and not align:
+        out.append(("text-align", "center"))
+    if el.tag == "center":
+        out.append(("text-align", "center"))
+    # deprecated `hidden`
+    if "hidden" in a:
+        out.append(("display", "none"))
+    return out
+
+
 class StyleEngine:
     def __init__(self, viewport=(1280, 800)):
         self.viewport = viewport
         self.sheets: list[Stylesheet] = []
         self._cache: dict[int, ComputedStyle] = {}
         self.root_font_size = 16.0
+        self._index: Optional[dict] = None
+        self._index_sheets: int = -1
 
     def add_sheet(self, sheet: Stylesheet) -> None:
         self.sheets.append(sheet)
+        self._index = None
 
     def add_css(self, text: str, origin: str = "author") -> None:
         self.add_sheet(parse_stylesheet(text, origin))
 
     # -- cascade -------------------------------------------------------
+    def _build_index(self) -> None:
+        """Bucket rules by their rightmost compound's key.
+
+        Selector matching is the hot path of style computation, so rules whose
+        subject cannot match an element's tag/id/class are never tested.  Buckets
+        are keyed ``("id", name)``, ``("class", name)``, ``("tag", name)`` or
+        ``("*", "")``; a rule is stored under every key it could match by, so an
+        element only ever tests the rules that have a chance.
+        """
+        if self._index_sheets == len(self.sheets) and self._index is not None:
+            return
+        index: dict[tuple, list] = {}
+        order = 0
+        for sheet in self.sheets:
+            origin_rank = 0 if sheet.origin == "ua" else 1
+            for rule in sheet.rules:
+                compound = rule.selector.parts[-1] if rule.selector.parts else None
+                keys: list[tuple] = []
+                if compound is not None:
+                    if compound.ids:
+                        keys.append(("id", compound.ids[-1]))
+                    if compound.classes:
+                        for cls in compound.classes:
+                            keys.append(("class", cls))
+                    if compound.tag and compound.tag != "*":
+                        keys.append(("tag", compound.tag))
+                if not keys:
+                    keys.append(("*", ""))
+                entry = (order, origin_rank, rule)
+                for key in keys:
+                    index.setdefault(key, []).append(entry)
+                order += 1
+        self._index = index
+        self._index_sheets = len(self.sheets)
+
+    def _candidate_rules(self, el: Element) -> list:
+        self._build_index()
+        seen: set[int] = set()
+        out: list[tuple] = []
+        tag = (el.tag or "").lower()
+        buckets = [("*", "")]
+        el_id = el.get_attribute("id")
+        if el_id:
+            buckets.append(("id", el_id))
+        buckets.append(("tag", tag))
+        for cls in (el.get_attribute("class") or "").split():
+            buckets.append(("class", cls))
+        for bucket in buckets:
+            for entry in self._index.get(bucket, ()):  # type: ignore[union-attr]
+                if entry[0] in seen:
+                    continue
+                seen.add(entry[0])
+                out.append(entry)
+        out.sort(key=lambda e: e[0])
+        return out
+
     def _declarations_for(self, el: Element, pseudo: Optional[str]) -> list[tuple]:
         """Return (sort_key, prop, value) for every matching declaration."""
         entries = []
-        order = 0
-        for sheet in self.sheets:
-            for rule in sheet.rules:
-                if rule.media and not media_matches(rule.media, self.viewport):
+        for order, origin_rank, rule in self._candidate_rules(el):
+            if rule.media and not media_matches(rule.media, self.viewport):
+                continue
+            subject = rule.selector.parts[-1] if rule.selector.parts else None
+            if subject is not None and subject.pseudo_element != pseudo:
+                # a rule with a pseudo-element only applies to that pseudo
+                if subject.pseudo_element is not None:
                     continue
-                if rule.selector.parts[-1].pseudo_element != pseudo:
-                    # a rule with a pseudo-element only applies to that pseudo
-                    if rule.selector.parts[-1].pseudo_element is not None:
-                        continue
-                if not matches(el, rule.selector):
-                    continue
-                spec = rule.selector.specificity()
-                origin_rank = 0 if sheet.origin == "ua" else 1
-                for d in rule.declarations:
-                    key = (1 if d.important else 0, origin_rank, spec, order)
-                    entries.append((key, d.prop, d.value))
-                order += 1
+            if not matches(el, rule.selector):
+                continue
+            spec = rule.selector.specificity()
+            for d in rule.declarations:
+                key = (1 if d.important else 0, origin_rank, spec, order)
+                entries.append((key, d.prop, d.value))
+        # presentational attributes (HTML "presentational hints")
+        for prop, value in _presentational_hints(el):
+            # author CSS must beat a presentational attribute, so these sort
+            # below every rule (specificity 0) but above the UA stylesheet only
+            # in the sense that they are applied later within the same tier.
+            entries.append(((0, 0, (0, 0, 0), 0), prop, value))
         # inline style
         if pseudo is None and el.style_attr:
             for d in parse_declarations(el.style_attr):
@@ -1156,8 +1313,6 @@ def ua_display(tag: str) -> str:
         return "table-cell"
     if tag == "tr":
         return "table-row"
-    if tag in ("thead", "tbody", "tfoot"):
-        return "table-row-group"
     if tag == "li":
         return "list-item"
     if tag in ("head", "script", "style", "meta", "link", "title", "base", "template"):
