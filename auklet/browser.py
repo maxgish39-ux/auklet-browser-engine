@@ -61,9 +61,9 @@ class ResourceLoader:
         self.base_url = base_url
         self.allow_network = allow_network
         self.timeout = timeout
+        self.cache: dict[str, Optional[bytes]] = {}
         self.client = client or HttpClient(timeout=timeout)
         self.errors: list[str] = []
-        self.cache: dict[str, Optional[bytes]] = {}
 
     def resolve(self, url: str) -> str:
         if not url:
@@ -261,13 +261,17 @@ class Browser:
 
     # -- stylesheets ----------------------------------------------------
     def _collect_stylesheets(self) -> None:
+        self.style_engine = StyleEngine(self.viewport)
+        self.style_engine.add_css(UA_CSS, origin="ua")
         if self.doc is None:
             return
+        order = 0
         for el in self.doc.elements():
             if el.tag == "style":
                 css = el.text_content()
-                if css.strip():
-                    self.style_engine.add_css(css, origin="author")
+                sheet = parse_stylesheet(css, "author", order)
+                self.style_engine.add_sheet(sheet)
+                order += len(sheet.rules)
             elif el.tag == "link":
                 rel = (el.get_attribute("rel") or "").lower()
                 if "stylesheet" in rel:
@@ -275,7 +279,10 @@ class Browser:
                     if href:
                         css = self.loader.fetch_text(href)
                         if css:
-                            self.style_engine.add_css(css, origin="author")
+                            sheet = parse_stylesheet(css, "author", order)
+                            self.style_engine.add_sheet(sheet)
+                            order += len(sheet.rules)
+        self.stats.rules = sum(len(s.rules) for s in self.style_engine.sheets)
 
     # -- scripts --------------------------------------------------------
     def _run_scripts(self) -> None:
@@ -331,15 +338,15 @@ class Browser:
         self.root_box = layout_document(self.doc, self.styles, self.viewport,
                                         image_size=self.loader.image_size)
         self.stats.layout_ms = (time.perf_counter() - t0) * 1000
+        # A page whose root box is shorter than its content is a containing-block
+        # artefact (`html {height:100%}` with content inside), not a real
+        # document height.  The scrollable height must cover all descendants.
+        _recompute_doc_height(self.root_box, self.viewport)
         self._box_index = {}
         for b in _iter_boxes(self.root_box):
             if b.element is not None and b.pseudo is None:
                 self._box_index.setdefault(id(b.element), b)
         self.stats.boxes = len(self._box_index)
-        # A page whose root box is shorter than its content is a containing-block
-        # artefact (`html {height:100%}` with content inside), not a real
-        # document height.  The scrollable height must cover all descendants.
-        _recompute_doc_height(self.root_box, self.viewport)
         self.stats.doc_height = self.root_box.h
         if self.js is not None:
             self.js.styles = self.styles
@@ -357,23 +364,6 @@ class Browser:
         self.image = painter.render()
         self.stats.paint_ms = (time.perf_counter() - t0) * 1000
         return self.image
-
-    def _canvas_background(self):
-        """CSS background propagation: html/body backgrounds paint the canvas."""
-        for el in (self.doc.body, self.doc.document_element) if self.doc else ():
-            if el is None:
-                continue
-            st = self.styles.get(id(el))
-            if st is None:
-                continue
-            col = st.color("background-color")
-            if col[3] > 0:
-                return col
-        return (255, 255, 255, 255)
-
-    def render(self) -> Image.Image:
-        self.relayout()
-        return self.paint()
 
     def render_viewport(self, scroll_y: float = 0.0, scale: int = 1) -> Image.Image:
         """Render only the visible slice of the page, for an interactive UI.
@@ -398,6 +388,23 @@ class Browser:
     def scroll_height(self) -> float:
         return float(self.root_box.h) if self.root_box is not None else 0.0
 
+    def _canvas_background(self):
+        """CSS background propagation: html/body backgrounds paint the canvas."""
+        for el in (self.doc.body, self.doc.document_element) if self.doc else ():
+            if el is None:
+                continue
+            st = self.styles.get(id(el))
+            if st is None:
+                continue
+            col = st.color("background-color")
+            if col[3] > 0:
+                return col
+        return (255, 255, 255, 255)
+
+    def render(self) -> Image.Image:
+        self.relayout()
+        return self.paint()
+
     def screenshot(self, path: str, full_page: bool = True) -> str:
         """Save a PNG.  ``full_page`` rasterises the document, capped at
         ``max_paint_height`` so a pathological page cannot exhaust memory."""
@@ -419,30 +426,45 @@ class Browser:
         el = self.element_at(x, y)
         if el is None:
             return False
+        # find nearest clickable ancestor
+        target = el
+        while target is not None and target.tag not in ("a", "button", "input", "label", "summary"):
+            target = target.parent if isinstance(target.parent, Element) else None
+        node = target or el
+        changed = False
         if self.js is not None:
-            self.js.fire_event(el, "click")
+            changed = self.js.fire_event(node, "click")
+            self.js.run_timers()
+        if changed or self._dirty:
+            self._dirty = False
             self.relayout()
-        return True
+        return changed
 
     def type_text(self, text: str) -> None:
         if self.js is None:
             return
-        active = getattr(self, "_active_element", None)
-        if active is not None:
-            self.js.fire_event(active, "input", {"data": text})
+        body = self.doc.body if self.doc else None
+        if body is not None:
+            self.js.fire_event(body, "keydown", {"key": text})
+            self.js.run_timers()
+            self.relayout()
 
     def box_for(self, el: Element) -> Optional[Box]:
-        if self.root_box is None:
-            return None
-        return find_box(self.root_box, el)
+        return self._box_index.get(id(el))
 
     def text_of(self, selector: str) -> str:
         if self.doc is None:
             return ""
-        el = self.doc.query_selector(selector)
-        return el.text_content() if el is not None else ""
+        from .css import matches, parse_selector
+        sel = parse_selector(selector)
+        if sel is None:
+            return ""
+        for n in self.doc.walk():
+            if isinstance(n, Element) and matches(n, sel):
+                return n.text_content()
+        return ""
 
     def dump_text(self) -> str:
-        if self.doc is None:
+        if self.doc is None or self.doc.body is None:
             return ""
-        return self.doc.text_content()
+        return self.doc.body.text_content()
