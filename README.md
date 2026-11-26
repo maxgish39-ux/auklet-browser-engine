@@ -36,16 +36,6 @@ URL ──▶ netstack (TCP + TLS + HTTP/1.1) ──▶ HTML bytes
 
 The name is a nod to the least auklet — a small, dense, surprisingly capable seabird.
 
-## Screenshots
-
-The browser UI rendering Hacker News (real HTTPS fetch, real CSS, real layout):
-
-![Auklet UI](docs/screenshot-ui.png)
-
-The engine rendering the Wikipedia "Bird" article body:
-
-![Wikipedia](docs/screenshot-wikipedia.png)
-
 ## Quick start
 
 ```bash
@@ -106,7 +96,7 @@ s.new_tab(); s.select(0); s.close_tab(1)
 Everything below is real code in this repository and is covered by the test
 suite. Nothing in this list is a stub.
 
-### Network stack — `auklet/netstack.py` (new)
+### Network stack — `auklet/netstack.py`
 
 A real HTTP/1.1 client over raw sockets, with no `urllib`/`requests` in the path:
 
@@ -130,7 +120,7 @@ A real HTTP/1.1 client over raw sockets, with no `urllib`/`requests` in the path
 - **Charset decoding**: declared charset, BOM sniffing, `<meta charset>`
   sniffing, and a cp1252 fallback instead of a crash.
 
-### Browser UI — `auklet/ui.py` (new)
+### Browser UI — `auklet/ui.py`, `auklet/browser_ui/`
 
 - Tab strip: new / close / switch, each tab with its own engine and history.
 - Address bar with Enter-to-navigate and URL normalisation.
@@ -168,12 +158,12 @@ A real HTTP/1.1 client over raw sockets, with no `urllib`/`requests` in the path
 - Lengths in `px % em rem pt pc in cm mm vw vh vmin vmax`, colours in hex
   (3/4/6/8), `rgb()`, `rgba()`, `hsl()`, `hsla()` and 140+ named colours.
 - `@media` with `min-width` / `max-width` / `min-height` / `max-height`.
-- **Presentational attributes** (new): `bgcolor`, `text`, `background`,
+- **Presentational attributes**: `bgcolor`, `text`, `background`,
   `<font color/face/size>`, `align`, `valign`, `width`/`height`, `cellpadding`,
   `<center>`, `hidden` — mapped to CSS with the correct precedence (author CSS
   still wins). This is what makes legacy table-based sites like Hacker News
   render with their real colours.
-- **Rule indexing** (new): rules are bucketed by their rightmost compound's
+- **Rule indexing**: rules are bucketed by their rightmost compound's
   id/class/tag, so an element only tests rules that could match. Style
   computation on a 31 000-node page dropped from minutes to seconds.
 - A user-agent stylesheet with correct default `display` values.
@@ -184,14 +174,14 @@ A real HTTP/1.1 client over raw sockets, with no `urllib`/`requests` in the path
 - Inline formatting: real font metrics, greedy line breaking, `text-align`
   (left/right/center/justify), `white-space: normal|nowrap|pre`, `text-indent`,
   `letter-spacing`, and inline-block shrink-to-fit.
-- **Correct inline whitespace** (new): a space between two inline elements is
+- **Correct inline whitespace**: a space between two inline elements is
   preserved as a real separator, so `<b>class</b> <i>Aves</i>` no longer
   renders as `classAves`.
 - Flexbox: row/column, `row-reverse`/`column-reverse`, `flex-wrap`,
   `justify-content` (start/end/center/space-between/around/evenly),
   `align-items` / `align-self` (stretch/center/end), `gap`, and
   `flex-grow` / `flex-shrink` / `flex-basis` resolution.
-- **CSS Grid** (new): `grid-template-columns` / `-rows` with fixed lengths,
+- **CSS Grid**: `grid-template-columns` / `-rows` with fixed lengths,
   `fr` units, `auto`, `minmax()`, `repeat()` (including `auto-fill`/`auto-fit`),
   `gap` / `row-gap` / `column-gap`, explicit `grid-column` / `grid-row`
   placement with `span`, automatic row-major placement that skips occupied
@@ -203,7 +193,7 @@ A real HTTP/1.1 client over raw sockets, with no `urllib`/`requests` in the path
   containing-block resolution, and `z-index` paint ordering.
 - List markers (`disc`, `circle`, `square`, `decimal`, `lower/upper-alpha`,
   `lower/upper-roman`).
-- **Document height** (new): a page that sets `html, body { height: 100% }`
+- **Document height**: a page that sets `html, body { height: 100% }`
   still reports its true scrollable height, so the UI can scroll to content
   below the fold.
 
@@ -214,7 +204,7 @@ A real HTTP/1.1 client over raw sockets, with no `urllib`/`requests` in the path
 - Text rasterisation through FreeType with the resolved font stack, plus
   `text-transform` and `text-decoration` (underline / line-through).
 - 2× supersampling with Lanczos downsampling for antialiased output.
-- **Viewport clipping** (new): a paint rect culls off-screen subtrees, and a
+- **Viewport clipping**: a paint rect culls off-screen subtrees, and a
   full-document raster is capped (`max_paint_height`) so a pathological page
   cannot exhaust memory.
 
@@ -280,7 +270,7 @@ Stated plainly so nothing here is overclaimed:
 - **No real form controls.** `<input>`, `<button>` and `<select>` are laid out
   and painted as boxes; they are not interactive widgets.
 - **No `XMLHttpRequest`, no ES modules.** `fetch()` and `localStorage` *are*
-  implemented (see below); `XMLHttpRequest` and ES module loading are not.
+  implemented (see above); `XMLHttpRequest` and ES module loading are not.
 - **No accessibility tree, no printing, no PDF export.**
 - **Large pages are slow.** Wikipedia's "Bird" article (31 833 nodes, 2 383
   rules) takes roughly 14 s to parse, style and lay out. It renders correctly,
