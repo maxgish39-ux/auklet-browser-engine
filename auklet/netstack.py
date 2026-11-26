@@ -1,401 +1,390 @@
-# ---------------------------------------------------------------------------
-# Chunked transfer decoding
-# ---------------------------------------------------------------------------
+"""Auklet network stack: HTTP/1.1 protocol primitives.
 
-class _BodyReader:
-    """Reads exactly one HTTP/1.1 message body off a buffered socket."""
+This module holds the parts of the client that are pure protocol work:
 
-    def __init__(self, sock, initial: bytes = b"", timeout: float = 20.0):
-        self.sock = sock
-        self.buf = bytearray(initial)
-        self.eof = False
-        self.timeout = timeout
+* URL normalisation and resolution.
+* An RFC 6265 cookie jar (domain/path matching, ``Secure``, ``HttpOnly``,
+  ``Max-Age``/``Expires`` in all three accepted date formats).
+* Response decoding: declared charset, BOM sniffing, ``<meta charset>``
+  sniffing and a cp1252 fallback.
+* Content-Encoding decoding for ``gzip``, ``deflate`` and ``br``.
+* Proxy selection from the environment, with ``NO_PROXY`` matching.
 
-    def _pump(self, want: int = 65536) -> bool:
-        if self.eof:
-            return False
-        try:
-            chunk = self.sock.recv(want)
-        except (socket.timeout, TimeoutError):
-            raise NetworkError("timed out while reading the response body")
-        except OSError as exc:
-            raise NetworkError(f"connection error: {exc}") from exc
-        if not chunk:
-            self.eof = True
-            return False
-        self.buf += chunk
+The socket machinery and the request/response cycle live in
+:mod:`auklet.http_client` and are re-exported here, so ``from auklet.netstack
+import HttpClient`` keeps working.
+"""
+
+from __future__ import annotations
+
+import gzip
+import ipaddress
+import os
+import re
+import time
+import zlib
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
+try:  # optional
+    import brotli as _brotli  # type: ignore
+except Exception:  # pragma: no cover
+    _brotli = None
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Auklet/2.0 (+https://github.com/maxgish39-ux/auklet-browser-engine)"
+)
+
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+class NetworkError(Exception):
+    """A transport-level failure (DNS, TCP, TLS, malformed response)."""
+
+
+def _split(url: str):
+    parts = urlsplit(url)
+    scheme = (parts.scheme or "http").lower()
+    host = parts.hostname or ""
+    port = parts.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    return scheme, host, port, path
+
+
+def normalize_url(url: str, base: str = "") -> str:
+    """Resolve ``url`` against ``base`` and give it a scheme."""
+    if base:
+        url = urljoin(base, url)
+    parts = urlsplit(url)
+    if not parts.scheme:
+        url = "http://" + url
+        parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        return url
+    host = parts.hostname or ""
+    try:
+        host = host.encode("idna").decode("ascii")
+    except Exception:
+        pass
+    netloc = host
+    if parts.port and parts.port not in (80, 443):
+        netloc = f"{host}:{parts.port}"
+    elif parts.port == 443 and scheme != "https":
+        netloc = f"{host}:443"
+    elif parts.port == 80 and scheme != "http":
+        netloc = f"{host}:80"
+    if parts.username:
+        cred = parts.username
+        if parts.password:
+            cred += ":" + parts.password
+        netloc = cred + "@" + netloc
+    path = parts.path or "/"
+    return urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
         return True
-
-    def readline(self) -> bytes:
-        while True:
-            idx = self.buf.find(b"\r\n")
-            if idx >= 0:
-                line = bytes(self.buf[:idx])
-                del self.buf[:idx + 2]
-                return line
-            if not self._pump():
-                line = bytes(self.buf)
-                self.buf.clear()
-                return line
-
-    def read_exact(self, n: int) -> bytes:
-        while len(self.buf) < n:
-            if not self._pump():
-                break
-        data = bytes(self.buf[:n])
-        del self.buf[:n]
-        return data
-
-    def read_all(self) -> bytes:
-        while self._pump():
-            pass
-        data = bytes(self.buf)
-        self.buf.clear()
-        return data
-
-    def read_chunked(self, limit: int) -> bytes:
-        out = bytearray()
-        while True:
-            line = self.readline()
-            if not line:
-                break
-            size_text = line.split(b";", 1)[0].strip()
-            try:
-                size = int(size_text, 16)
-            except ValueError:
-                raise NetworkError("malformed chunk size in response")
-            if size == 0:
-                while True:
-                    trailer = self.readline()
-                    if not trailer:
-                        break
-                break
-            out += self.read_exact(size)
-            self.readline()
-            if len(out) > limit:
-                raise NetworkError("response body exceeded the size limit")
-        return bytes(out)
+    except ValueError:
+        return False
 
 
-class _Connection:
-    def __init__(self, sock, key, secure: bool):
-        self.sock = sock
-        self.key = key
-        self.secure = secure
-        self.reader: Optional[_BodyReader] = None
-        self.created = time.time()
-        self.requests = 0
+def _no_proxy(host: str) -> bool:
+    raw = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    host = (host or "").lower()
+    for entry in raw.split(","):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        if entry.startswith("."):
+            if host.endswith(entry) or host == entry[1:]:
+                return True
+        elif host == entry or host.endswith("." + entry):
+            return True
+    return False
 
-    def is_alive(self) -> bool:
-        """True when a pooled connection can take another request."""
-        if self.reader is not None and self.reader.eof:
+
+def proxy_for(scheme: str, host: str) -> Optional[str]:
+    """Return the proxy URL to use for this target, or None for a direct link."""
+    if _no_proxy(host):
+        return None
+    if scheme == "https":
+        for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            if os.environ.get(key):
+                return os.environ[key]
+    for key in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        if os.environ.get(key):
+            return os.environ[key]
+    return None
+
+
+@dataclass
+class Cookie:
+    name: str
+    value: str
+    domain: str
+    path: str = "/"
+    secure: bool = False
+    http_only: bool = False
+    expires: Optional[float] = None
+    host_only: bool = True
+
+    def expired(self, now: Optional[float] = None) -> bool:
+        if self.expires is None:
             return False
-        try:
-            import select as _select
-            r, _, _ = _select.select([self.sock], [], [], 0)
-        except (OSError, ValueError):
+        return self.expires <= (now if now is not None else time.time())
+
+
+class CookieJar:
+    """A small but correct RFC 6265 jar."""
+
+    def __init__(self):
+        self.cookies: list[Cookie] = []
+
+    def set_from_headers(self, url: str, headers: list[tuple[str, str]]) -> None:
+        scheme, host, _port, path = _split(url)
+        host = (host or "").lower()
+        default_path = path.rsplit("/", 1)[0] + "/" if "/" in path else "/"
+        for key, value in headers:
+            if key.lower() != "set-cookie":
+                continue
+            parts = [p.strip() for p in value.split(";")]
+            if not parts or "=" not in parts[0]:
+                continue
+            name, _, val = parts[0].partition("=")
+            name, val = name.strip(), val.strip()
+            if not name:
+                continue
+            c = Cookie(name=name, value=val, domain=host, path=default_path)
+            for attr in parts[1:]:
+                k, _, v = attr.partition("=")
+                k, v = k.strip().lower(), v.strip()
+                if k == "domain" and v:
+                    v = v.lstrip(".").lower()
+                    if host == v or host.endswith("." + v):
+                        c.domain = v
+                        c.host_only = False
+                elif k == "path" and v.startswith("/"):
+                    c.path = v
+                elif k == "secure":
+                    c.secure = True
+                elif k == "httponly":
+                    c.http_only = True
+                elif k == "max-age":
+                    try:
+                        c.expires = time.time() + float(v)
+                    except ValueError:
+                        pass
+                elif k == "expires":
+                    c.expires = _parse_cookie_date(v) or c.expires
+            if c.secure and scheme != "https":
+                continue
+            self._store(c)
+
+    def _store(self, c: Cookie) -> None:
+        for i, old in enumerate(self.cookies):
+            if old.name == c.name and old.domain == c.domain and old.path == c.path:
+                if c.expired():
+                    del self.cookies[i]
+                else:
+                    self.cookies[i] = c
+                return
+        if not c.expired():
+            self.cookies.append(c)
+
+    def _matches(self, c: Cookie, host: str, path: str) -> bool:
+        if c.host_only:
+            if host != c.domain:
+                return False
+        elif not (host == c.domain or host.endswith("." + c.domain)):
             return False
-        if r:
-            return False
-        return True
+        if path == c.path:
+            return True
+        if path.startswith(c.path):
+            if c.path.endswith("/"):
+                return True
+            return path[len(c.path):].startswith("/")
+        return False
 
-    def close(self) -> None:
-        try:
-            self.sock.close()
-        except Exception:
-            pass
+    def header_for(self, url: str) -> str:
+        scheme, host, _port, path = _split(url)
+        host = (host or "").lower()
+        now = time.time()
+        alive, pairs = [], []
+        for c in self.cookies:
+            if c.expired(now):
+                continue
+            alive.append(c)
+            if c.secure and scheme != "https":
+                continue
+            if self._matches(c, host, path or "/"):
+                pairs.append(f"{c.name}={c.value}")
+        self.cookies = alive
+        return "; ".join(pairs)
+
+    def clear(self) -> None:
+        self.cookies.clear()
 
 
-class HttpClient:
-    """A keep-alive HTTP/1.1 client over raw sockets."""
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
 
-    def __init__(self, timeout: float = 20.0, max_body: int = 24 * 1024 * 1024,
-                 user_agent: str = DEFAULT_UA, verify_tls: bool = True,
-                 max_conns: int = 8):
-        self.timeout = timeout
-        self.max_body = max_body
-        self.user_agent = user_agent
-        self.verify_tls = verify_tls
-        self.max_conns = max_conns
-        self.cookies = CookieJar()
-        self.connections: dict[tuple, _Connection] = {}
-        self._ssl_ctx: Optional[ssl.SSLContext] = None
-        self.stats = {"requests": 0, "bytes": 0, "connects": 0, "reused": 0}
 
-    def ssl_context(self) -> ssl.SSLContext:
-        if self._ssl_ctx is None:
-            ctx = ssl.create_default_context()
-            if not self.verify_tls:
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+def _parse_cookie_date(value: str) -> Optional[float]:
+    value = value.strip()
+    m = re.match(r"[A-Za-z]{3},\s*(\d{1,2})[-\s]([A-Za-z]{3})[-\s](\d{2,4})\s+"
+                 r"(\d{1,2}):(\d{2}):(\d{2})", value)
+    if not m:
+        m = re.match(r"[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+"
+                     r"(\d{1,2}):(\d{2}):(\d{2})\s+(\d{2,4})", value)
+        if m:
+            mon, day, hh, mm, ss, yr = m.groups()
+            return _epoch(int(yr), _MONTHS.get(mon.lower(), 1), int(day),
+                          int(hh), int(mm), int(ss))
+        return None
+    day, mon, yr, hh, mm, ss = m.groups()
+    return _epoch(int(yr), _MONTHS.get(mon.lower(), 1), int(day),
+                  int(hh), int(mm), int(ss))
+
+
+def _epoch(year: int, month: int, day: int, hh: int, mm: int, ss: int) -> Optional[float]:
+    import calendar
+    if year < 100:
+        year += 1900 if year >= 70 else 2000
+    try:
+        return float(calendar.timegm((year, month, day, hh, mm, ss, 0, 0, 0)))
+    except Exception:
+        return None
+
+
+@dataclass
+class Response:
+    url: str
+    status: int
+    reason: str
+    headers: list[tuple[str, str]]
+    body: bytes
+    http_version: str = "HTTP/1.1"
+    redirects: list[str] = field(default_factory=list)
+    from_cache: bool = False
+
+    def header(self, name: str, default: str = "") -> str:
+        lname = name.lower()
+        for k, v in self.headers:
+            if k.lower() == lname:
+                return v
+        return default
+
+    def headers_all(self, name: str) -> list[str]:
+        lname = name.lower()
+        return [v for k, v in self.headers if k.lower() == lname]
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
+
+    @property
+    def charset(self) -> Optional[str]:
+        ctype = self.header("content-type")
+        m = re.search(r"charset\s*=\s*[\"']?([\w\-:.]+)", ctype, re.I)
+        return m.group(1) if m else None
+
+    @property
+    def content_type(self) -> str:
+        return self.header("content-type").split(";")[0].strip().lower()
+
+    def text(self, fallback: str = "utf-8") -> str:
+        return decode_body(self.body, self.charset or fallback,
+                           self.header("content-type"))
+
+    def json(self):
+        import json
+        return json.loads(self.text())
+
+
+def decode_body(body: bytes, charset: Optional[str] = None,
+                content_type: str = "") -> str:
+    """Decode bytes to text, sniffing BOMs and ``<meta charset>`` when needed."""
+    if not body:
+        return ""
+    for bom, enc in ((b"\xef\xbb\xbf", "utf-8-sig"), (b"\xff\xfe", "utf-16-le"),
+                     (b"\xfe\xff", "utf-16-be")):
+        if body.startswith(bom):
             try:
-                ctx.set_alpn_protocols(["http/1.1"])
-            except NotImplementedError:
-                pass
-            try:
-                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                return body.decode(enc, errors="replace")
             except Exception:
                 pass
-            self._ssl_ctx = ctx
-        return self._ssl_ctx
-
-    def _tcp(self, host: str, port: int) -> socket.socket:
+    if charset:
         try:
-            sock = socket.create_connection((host, port), timeout=self.timeout)
-        except socket.gaierror as exc:
-            raise NetworkError(f"could not resolve {host!r}: {exc}") from exc
-        except (socket.timeout, TimeoutError) as exc:
-            raise NetworkError(f"timed out connecting to {host}:{port}") from exc
-        except OSError as exc:
-            raise NetworkError(f"could not connect to {host}:{port}: {exc}") from exc
-        sock.settimeout(self.timeout)
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
+            return body.decode(charset, errors="replace")
+        except (LookupError, UnicodeDecodeError):
             pass
-        self.stats["connects"] += 1
-        return sock
-
-    def _connect(self, scheme: str, host: str, port: int) -> _Connection:
-        key = (scheme, host, port)
-        conn = self.connections.get(key)
-        if conn is not None:
-            if conn.is_alive():
-                return conn
-            conn.close()
-            self.connections.pop(key, None)
-        proxy = proxy_for(scheme, host)
-        if proxy:
-            sock = self._connect_via_proxy(proxy, scheme, host, port)
-        else:
-            sock = self._tcp(host, port)
-            if scheme == "https":
-                sock = self._wrap_tls(sock, host)
-        return _Connection(sock, key, scheme == "https")
-
-    def _connect_via_proxy(self, proxy: str, scheme: str, host: str, port: int):
-        p = urlsplit(proxy if "://" in proxy else "http://" + proxy)
-        p_host, p_port = p.hostname or "127.0.0.1", p.port or 8080
-        sock = self._tcp(p_host, p_port)
-        auth = ""
-        if p.username:
-            cred = f"{p.username}:{p.password or ''}".encode()
-            auth = "Proxy-Authorization: Basic " + base64.b64encode(cred).decode() + "\r\n"
-        if scheme == "https":
-            target = f"{host}:{port}"
-            req = (f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
-                   f"User-Agent: {self.user_agent}\r\n{auth}\r\n")
-            sock.sendall(req.encode("latin-1"))
-            reader = _BodyReader(sock)
-            status_line = reader.readline().decode("latin-1", "replace")
-            while reader.readline():
-                pass
-            parts = status_line.split(" ", 2)
-            code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            if code != 200:
-                sock.close()
-                raise NetworkError(f"proxy refused CONNECT ({status_line.strip()})")
-            leftover = bytes(reader.buf)
-            sock = self._wrap_tls(sock, host)
-            if leftover:
-                try:
-                    sock.unread(leftover)
-                except Exception:
-                    pass
-            return sock
-        return sock
-
-    def _wrap_tls(self, sock: socket.socket, host: str) -> ssl.SSLSocket:
+    head = body[:4096].decode("ascii", errors="replace")
+    m = re.search(r"""<meta[^>]+charset\s*=\s*["']?([\w\-:.]+)""", head, re.I)
+    if m:
         try:
-            return self.ssl_context().wrap_socket(sock, server_hostname=host)
-        except ssl.SSLCertVerificationError as exc:
-            raise NetworkError(
-                f"TLS certificate for {host} could not be verified: {exc.verify_message}"
-            ) from exc
-        except ssl.SSLError as exc:
-            raise NetworkError(f"TLS handshake with {host} failed: {exc}") from exc
-
-    def _request_bytes(self, method: str, scheme: str, host: str, port: int,
-                       path: str, headers: dict[str, str], body: bytes) -> bytes:
-        proxy = proxy_for(scheme, host)
-        default_port = 443 if scheme == "https" else 80
-        host_hdr = host if port == default_port else f"{host}:{port}"
-        if proxy and scheme == "http":
-            target = f"http://{host_hdr}{path}"
-        else:
-            target = path
-        lines = [f"{method} {target} HTTP/1.1", f"Host: {host_hdr}"]
-        merged = {
-            "User-Agent": self.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": supported_encodings(),
-            "Connection": "keep-alive",
-        }
-        for k, v in headers.items():
-            merged[k] = v
-        cookie = self.cookies.header_for(f"{scheme}://{host_hdr}{path}")
-        if cookie and "Cookie" not in merged:
-            merged["Cookie"] = cookie
-        if body and "Content-Length" not in merged:
-            merged["Content-Length"] = str(len(body))
-        for k, v in merged.items():
-            if v is None:
-                continue
-            lines.append(f"{k}: {v}")
-        head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace")
-        return head + (body or b"")
-
-    def _read_response(self, conn: _Connection, url: str,
-                       method: str = "GET") -> Response:
-        if conn.reader is None:
-            conn.reader = _BodyReader(conn.sock, b"", self.timeout)
-        reader = conn.reader
-        while True:
-            status_line = reader.readline().decode("latin-1", "replace").strip()
-            if not status_line:
-                raise NetworkError("server closed the connection without responding")
-            parts = status_line.split(" ", 2)
-            if len(parts) < 2 or not parts[1].isdigit():
-                raise NetworkError(f"malformed status line: {status_line!r}")
-            version, code = parts[0], int(parts[1])
-            reason = parts[2] if len(parts) > 2 else ""
-            headers: list[tuple[str, str]] = []
-            while True:
-                line = reader.readline()
-                if not line:
-                    break
-                text = line.decode("latin-1", "replace")
-                if text[:1] in (" ", "\t") and headers:
-                    k, v = headers[-1]
-                    headers[-1] = (k, v + " " + text.strip())
-                    continue
-                k, _, v = text.partition(":")
-                headers.append((k.strip(), v.strip()))
-            if 100 <= code < 200:
-                continue
-            break
-
-        def h(name: str) -> str:
-            low = name.lower()
-            for k, v in headers:
-                if k.lower() == low:
-                    return v
-            return ""
-
-        body = b""
-        if code not in (204, 304):
-            te = h("transfer-encoding").lower()
-            if "chunked" in te:
-                body = reader.read_chunked(self.max_body)
-            elif h("content-length").isdigit():
-                body = reader.read_exact(min(int(h("content-length")), self.max_body))
-            elif method != "HEAD":
-                body = reader.read_all()[: self.max_body]
-
-        body = decompress(body, h("content-encoding"))
-        self.stats["bytes"] += len(body)
-        self.cookies.set_from_headers(url, headers)
-        if h("connection").lower() == "close":
-            reader.eof = True
-
-        return Response(url=url, status=code, reason=reason, headers=headers,
-                        body=body, http_version=version)
-
-    def request(self, method: str, url: str, headers: Optional[dict] = None,
-                body: bytes = b"", allow_redirects: bool = True,
-                max_redirects: int = 8) -> Response:
-        url = normalize_url(url)
-        headers = dict(headers or {})
-        seen: list[str] = []
-        for _hop in range(max_redirects + 1):
-            scheme, host, port, path = _split(url)
-            if scheme not in ("http", "https"):
-                raise NetworkError(f"unsupported URL scheme: {scheme!r}")
-            key = (scheme, host, port)
-            conn = self.connections.get(key)
-            reused = conn is not None and conn.is_alive()
-            if conn is None or not reused:
-                if conn is not None:
-                    conn.close()
-                conn = self._connect(scheme, host, port)
-                self.connections[key] = conn
-                if len(self.connections) > self.max_conns:
-                    self._evict()
-            if reused:
-                self.stats["reused"] += 1
-            hdrs = dict(headers)
-            payload = body if method in ("POST", "PUT", "PATCH", "DELETE") else b""
-            packet = self._request_bytes(method, scheme, host, port, path, hdrs, payload)
-            self.stats["requests"] += 1
-            attempts = 2 if (reused and method in ("GET", "HEAD")) else 1
-            for attempt in range(attempts):
-                try:
-                    conn.sock.sendall(packet)
-                    resp = self._read_response(conn, url, method)
-                    break
-                except (NetworkError, OSError) as exc:
-                    conn.close()
-                    self.connections.pop(key, None)
-                    if attempt + 1 >= attempts:
-                        if isinstance(exc, NetworkError):
-                            raise
-                        raise NetworkError(f"failed to send request: {exc}") from exc
-                    conn = self._connect(scheme, host, port)
-                    self.connections[key] = conn
-
-            if allow_redirects and resp.status in REDIRECT_CODES:
-                location = resp.header("location")
-                if location:
-                    target = normalize_url(location, url)
-                    seen.append(url)
-                    if resp.status == 303 or (resp.status in (301, 302) and method == "POST"):
-                        method, body, headers = "GET", b"", {
-                            k: v for k, v in headers.items()
-                            if k.lower() not in ("content-type", "content-length")}
-                    if _split(url)[1] != _split(target)[1]:
-                        headers.pop("Authorization", None)
-                    url = target
-                    continue
-            resp.redirects = seen
-            return resp
-        raise NetworkError(f"too many redirects (last: {url})")
-
-    def _evict(self) -> None:
-        if len(self.connections) <= self.max_conns:
-            return
-        oldest = min(self.connections.items(), key=lambda kv: kv[1].created)
-        oldest[1].close()
-        self.connections.pop(oldest[0], None)
-
-    def get(self, url: str, headers: Optional[dict] = None, **kw) -> Response:
-        return self.request("GET", url, headers=headers, **kw)
-
-    def post(self, url: str, data: bytes = b"", headers: Optional[dict] = None,
-             **kw) -> Response:
-        return self.request("POST", url, headers=headers, body=data, **kw)
-
-    def close(self) -> None:
-        for conn in self.connections.values():
-            conn.close()
-        self.connections.clear()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-
-def fetch(url: str, timeout: float = 20.0, headers: Optional[dict] = None,
-          client: Optional[HttpClient] = None) -> Optional[Response]:
-    """One-shot GET helper. Returns None on transport failure."""
-    own = client is None
-    cli = client or HttpClient(timeout=timeout)
+            return body.decode(m.group(1), errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            pass
     try:
-        return cli.get(url, headers=headers)
-    except NetworkError:
-        return None
-    finally:
-        if own:
-            cli.close()
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body.decode("cp1252", errors="replace")
+
+
+def _gunzip(data: bytes) -> bytes:
+    try:
+        return gzip.decompress(data)
+    except Exception:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        return d.decompress(data) + d.flush()
+
+
+def _inflate(data: bytes) -> bytes:
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        try:
+            d = zlib.decompressobj(wbits)
+            return d.decompress(data) + d.flush()
+        except zlib.error:
+            continue
+    return data
+
+
+def decompress(body: bytes, encoding: str) -> bytes:
+    enc = (encoding or "").strip().lower()
+    if not enc or enc == "identity" or not body:
+        return body
+    for part in reversed([e.strip() for e in enc.split(",") if e.strip()]):
+        if part in ("gzip", "x-gzip"):
+            body = _gunzip(body)
+        elif part == "deflate":
+            body = _inflate(body)
+        elif part == "br":
+            body = _brotli.decompress(body) if _brotli else body
+        elif part in ("zstd", "identity"):
+            continue
+    return body
+
+
+def supported_encodings() -> str:
+    encs = ["gzip", "deflate"]
+    if _brotli is not None:
+        encs.insert(0, "br")
+    return ", ".join(encs)
+
+
+# The connection/request cycle lives in ``http_client`` so each module stays a
+# readable size.  Imported at the bottom because it depends on the primitives
+# defined above.
+from .http_client import HttpClient, fetch  # noqa: E402,F401
