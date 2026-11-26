@@ -2,7 +2,7 @@
 
 Split out of :mod:`auklet.netstack` so the protocol primitives (URL handling,
 cookies, response decoding) and the socket machinery stay separately readable.
-Everything here is re-exported from ``netstack``.
+Everything here is imported back into ``netstack`` at the bottom of that module.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import socket
 import ssl
+import threading
 import time
 from typing import Optional
 from urllib.parse import urlsplit
@@ -18,6 +19,10 @@ from .netstack import (DEFAULT_UA, REDIRECT_CODES, CookieJar, NetworkError,
                        Response, _split, decompress, normalize_url, proxy_for,
                        supported_encodings)
 
+
+# ---------------------------------------------------------------------------
+# Chunked transfer decoding
+# ---------------------------------------------------------------------------
 
 class _BodyReader:
     """Reads exactly one HTTP/1.1 message body off a buffered socket."""
@@ -82,17 +87,22 @@ class _BodyReader:
             except ValueError:
                 raise NetworkError("malformed chunk size in response")
             if size == 0:
+                # trailers
                 while True:
                     trailer = self.readline()
                     if not trailer:
                         break
                 break
             out += self.read_exact(size)
-            self.readline()
+            self.readline()  # CRLF after the chunk data
             if len(out) > limit:
                 raise NetworkError("response body exceeded the size limit")
         return bytes(out)
 
+
+# ---------------------------------------------------------------------------
+# Connection pool
+# ---------------------------------------------------------------------------
 
 class _Connection:
     def __init__(self, sock, key, secure: bool):
@@ -104,7 +114,13 @@ class _Connection:
         self.requests = 0
 
     def is_alive(self) -> bool:
-        """True when a pooled connection can take another request."""
+        """True when a pooled connection can take another request.
+
+        A finite-length body (Content-Length / chunked) leaves the socket open;
+        a body read to EOF leaves ``reader.eof`` set.  Servers also close idle
+        keep-alive sockets without telling us, so the socket is polled for a
+        readable state (which means EOF or unsolicited data) before reuse.
+        """
         if self.reader is not None and self.reader.eof:
             return False
         try:
@@ -112,7 +128,11 @@ class _Connection:
             r, _, _ = _select.select([self.sock], [], [], 0)
         except (OSError, ValueError):
             return False
-        return not r
+        if r:
+            # Readable: either the peer closed or it sent bytes we did not ask
+            # for.  Either way the pipeline is out of sync — do not reuse.
+            return False
+        return True
 
     def close(self) -> None:
         try:
@@ -133,10 +153,15 @@ class HttpClient:
         self.verify_tls = verify_tls
         self.max_conns = max_conns
         self.cookies = CookieJar()
-        self.connections: dict[tuple, _Connection] = {}
+        # Idle connections per (scheme, host, port).  A connection is removed
+        # from the pool while it is in use, so two threads never share a socket.
+        self.connections: dict[tuple, list[_Connection]] = {}
+        self._pool_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
         self._ssl_ctx: Optional[ssl.SSLContext] = None
         self.stats = {"requests": 0, "bytes": 0, "connects": 0, "reused": 0}
 
+    # -- TLS ----------------------------------------------------------
     def ssl_context(self) -> ssl.SSLContext:
         if self._ssl_ctx is None:
             ctx = ssl.create_default_context()
@@ -145,15 +170,16 @@ class HttpClient:
                 ctx.verify_mode = ssl.CERT_NONE
             try:
                 ctx.set_alpn_protocols(["http/1.1"])
-            except NotImplementedError:
+            except NotImplementedError:  # pragma: no cover
                 pass
             try:
                 ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            except Exception:
+            except Exception:  # pragma: no cover
                 pass
             self._ssl_ctx = ctx
         return self._ssl_ctx
 
+    # -- sockets ------------------------------------------------------
     def _tcp(self, host: str, port: int) -> socket.socket:
         try:
             sock = socket.create_connection((host, port), timeout=self.timeout)
@@ -173,12 +199,6 @@ class HttpClient:
 
     def _connect(self, scheme: str, host: str, port: int) -> _Connection:
         key = (scheme, host, port)
-        conn = self.connections.get(key)
-        if conn is not None:
-            if conn.is_alive():
-                return conn
-            conn.close()
-            self.connections.pop(key, None)
         proxy = proxy_for(scheme, host)
         if proxy:
             sock = self._connect_via_proxy(proxy, scheme, host, port)
@@ -203,13 +223,15 @@ class HttpClient:
             sock.sendall(req.encode("latin-1"))
             reader = _BodyReader(sock)
             status_line = reader.readline().decode("latin-1", "replace")
-            while reader.readline():
+            while reader.readline():  # drain proxy headers
                 pass
             parts = status_line.split(" ", 2)
             code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
             if code != 200:
                 sock.close()
                 raise NetworkError(f"proxy refused CONNECT ({status_line.strip()})")
+            # Bytes the proxy already sent past its headers belong to the TLS
+            # stream, so they must be handed to the wrapped socket.
             leftover = bytes(reader.buf)
             sock = self._wrap_tls(sock, host)
             if leftover:
@@ -218,7 +240,7 @@ class HttpClient:
                 except Exception:
                     pass
             return sock
-        return sock
+        return sock  # absolute-form request lines are used for plain http
 
     def _wrap_tls(self, sock: socket.socket, host: str) -> ssl.SSLSocket:
         try:
@@ -230,6 +252,7 @@ class HttpClient:
         except ssl.SSLError as exc:
             raise NetworkError(f"TLS handshake with {host} failed: {exc}") from exc
 
+    # -- request building ---------------------------------------------
     def _request_bytes(self, method: str, scheme: str, host: str, port: int,
                        path: str, headers: dict[str, str], body: bytes) -> bytes:
         proxy = proxy_for(scheme, host)
@@ -261,10 +284,12 @@ class HttpClient:
         head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace")
         return head + (body or b"")
 
+    # -- response parsing ---------------------------------------------
     def _read_response(self, conn: _Connection, url: str,
                        method: str = "GET") -> Response:
         if conn.reader is None:
-            conn.reader = _BodyReader(conn.sock, b"", self.timeout)
+            pending = b""
+            conn.reader = _BodyReader(conn.sock, pending, self.timeout)
         reader = conn.reader
         while True:
             status_line = reader.readline().decode("latin-1", "replace").strip()
@@ -281,14 +306,14 @@ class HttpClient:
                 if not line:
                     break
                 text = line.decode("latin-1", "replace")
-                if text[:1] in (" ", "\t") and headers:
+                if text[:1] in (" ", "\t") and headers:  # obsolete line folding
                     k, v = headers[-1]
                     headers[-1] = (k, v + " " + text.strip())
                     continue
                 k, _, v = text.partition(":")
                 headers.append((k.strip(), v.strip()))
             if 100 <= code < 200:
-                continue
+                continue  # interim response (100-continue, 103 early hints)
             break
 
         def h(name: str) -> str:
@@ -314,12 +339,21 @@ class HttpClient:
         if h("connection").lower() == "close":
             reader.eof = True
 
-        return Response(url=url, status=code, reason=reason, headers=headers,
+        resp = Response(url=url, status=code, reason=reason, headers=headers,
                         body=body, http_version=version)
+        return resp
 
+    # -- public API ---------------------------------------------------
     def request(self, method: str, url: str, headers: Optional[dict] = None,
                 body: bytes = b"", allow_redirects: bool = True,
                 max_redirects: int = 8) -> Response:
+        """Perform a request, taking a pooled connection for its duration.
+
+        Connections are pooled per (scheme, host, port) and each one is
+        checked out exclusively, so several threads can be in flight at once
+        against the same host -- which is what lets ``Promise.all([fetch(a),
+        fetch(b)])`` actually overlap instead of queueing.
+        """
         url = normalize_url(url)
         headers = dict(headers or {})
         seen: list[str] = []
@@ -328,22 +362,20 @@ class HttpClient:
             if scheme not in ("http", "https"):
                 raise NetworkError(f"unsupported URL scheme: {scheme!r}")
             key = (scheme, host, port)
-            conn = self.connections.get(key)
-            reused = conn is not None and conn.is_alive()
-            if conn is None or not reused:
-                if conn is not None:
-                    conn.close()
-                conn = self._connect(scheme, host, port)
-                self.connections[key] = conn
-                if len(self.connections) > self.max_conns:
-                    self._evict()
-            if reused:
-                self.stats["reused"] += 1
+            conn, reused = self._checkout(key)
             hdrs = dict(headers)
             payload = body if method in ("POST", "PUT", "PATCH", "DELETE") else b""
             packet = self._request_bytes(method, scheme, host, port, path, hdrs, payload)
-            self.stats["requests"] += 1
+            with self._stats_lock:
+                self.stats["requests"] += 1
+                if reused:
+                    self.stats["reused"] += 1
+            # A pooled connection can die between the liveness poll and the send
+            # (servers close idle keep-alive sockets).  Retrying once on a fresh
+            # socket is what browsers do for idempotent requests; a request with
+            # a body is never silently replayed.
             attempts = 2 if (reused and method in ("GET", "HEAD")) else 1
+            resp = None
             for attempt in range(attempts):
                 try:
                     conn.sock.sendall(packet)
@@ -351,13 +383,13 @@ class HttpClient:
                     break
                 except (NetworkError, OSError) as exc:
                     conn.close()
-                    self.connections.pop(key, None)
                     if attempt + 1 >= attempts:
                         if isinstance(exc, NetworkError):
                             raise
                         raise NetworkError(f"failed to send request: {exc}") from exc
                     conn = self._connect(scheme, host, port)
-                    self.connections[key] = conn
+            # Return the connection to the pool only if it is still usable.
+            self._checkin(key, conn)
 
             if allow_redirects and resp.status in REDIRECT_CODES:
                 location = resp.header("location")
@@ -368,6 +400,7 @@ class HttpClient:
                         method, body, headers = "GET", b"", {
                             k: v for k, v in headers.items()
                             if k.lower() not in ("content-type", "content-length")}
+                    # strip credentials when the redirect crosses origins
                     if _split(url)[1] != _split(target)[1]:
                         headers.pop("Authorization", None)
                     url = target
@@ -376,12 +409,47 @@ class HttpClient:
             return resp
         raise NetworkError(f"too many redirects (last: {url})")
 
-    def _evict(self) -> None:
-        if len(self.connections) <= self.max_conns:
+    def _checkout(self, key: tuple):
+        """Take an idle connection for *key*, or open a new one.
+
+        Returns ``(connection, reused)``.  The connection is owned by the
+        caller until it is handed back with :metho`:`_checkin`.
+        """
+        with self._pool_lock:
+            pool = self.connections.get(key)
+            while pool:
+                conn = pool.pop()
+                if conn.is_alive():
+                    return conn, True
+                conn.close()
+        scheme, host, port = key
+        return self._connect(scheme, host, port), False
+
+    def _checkin(self, key: tuple, conn: _Connection) -> None:
+        """Return a connection to the pool, or close it if it is spent."""
+        if conn.reader is not None and conn.reader.eof:
+            conn.close()
             return
-        oldest = min(self.connections.items(), key=lambda kv: kv[1].created)
-        oldest[1].close()
-        self.connections.pop(oldest[0], None)
+        with self._pool_lock:
+            pool = self.connections.setdefault(key, [])
+            if len(pool) >= self.max_conns:
+                conn.close()
+                return
+            pool.append(conn)
+
+    def _evict(self) -> None:
+        with self._pool_lock:
+            total = sum(len(p) for p in self.connections.values())
+            if total <= self.max_conns:
+                return
+            oldest_key, oldest = None, None
+            for k, pool in self.connections.items():
+                for c in pool:
+                    if oldest is None or c.created < oldest.created:
+                        oldest_key, oldest = k, c
+            if oldest is not None:
+                self.connections[oldest_key].remove(oldest)
+                oldest.close()
 
     def get(self, url: str, headers: Optional[dict] = None, **kw) -> Response:
         return self.request("GET", url, headers=headers, **kw)
@@ -391,9 +459,11 @@ class HttpClient:
         return self.request("POST", url, headers=headers, body=data, **kw)
 
     def close(self) -> None:
-        for conn in self.connections.values():
-            conn.close()
-        self.connections.clear()
+        with self._pool_lock:
+            for pool in self.connections.values():
+                for conn in pool:
+                    conn.close()
+            self.connections.clear()
 
     def __enter__(self):
         return self
