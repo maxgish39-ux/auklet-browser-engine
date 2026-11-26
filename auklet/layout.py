@@ -6,6 +6,7 @@ Implements a real box model and formatting contexts:
 * inline formatting with greedy line breaking, text-align, white-space
 * inline-block shrink-to-fit
 * flexbox (row/column, wrap, justify-content, align-items, gap, grow/shrink)
+* CSS grid (explicit tracks, fr distribution, auto-placement, gaps)
 * tables (auto column widths, row heights, border-spacing)
 * floats (left/right) with line shortening
 * absolute / fixed / relative positioning
@@ -62,6 +63,7 @@ class Box:
         self.intrinsic: Optional[tuple[float, float]] = None
         self.scroll_w = self.scroll_h = 0.0
         self.fragments: list[tuple[float, float, float, float]] = []
+        self.flex_base = 0.0
 
     # geometry helpers -------------------------------------------------
     @property
@@ -178,7 +180,7 @@ def _build_children(box: Box, el: Element, styles: dict[int, ComputedStyle],
             size = ctx.image_size(child)
             b.intrinsic = size
         box.add(b)
-        if kind in ("block", "flex", "table", "list-item", "inline-block", "table-row",
+        if kind in ("block", "flex", "grid", "table", "list-item", "inline-block", "table-row",
                     "table-cell", "table-row-group", "table-caption"):
             _build_children(b, child, styles, ctx)
         elif kind == "inline":
@@ -223,6 +225,8 @@ def _box_kind(st: ComputedStyle, el: Element) -> str:
         return "none"
     if display == "flex" or display == "inline-flex":
         return "flex"
+    if display == "grid" or display == "inline-grid":
+        return "grid"
     if display == "table":
         return "table"
     if display == "table-row":
@@ -301,7 +305,7 @@ def _edges(box: Box, base: float, ctx: LayoutContext) -> None:
 
 
 def _is_block_level(box: Box) -> bool:
-    return box.kind in ("block", "flex", "table", "list-item", "table-row",
+    return box.kind in ("block", "flex", "grid", "table", "list-item", "table-row",
                         "table-cell", "table-row-group", "table-caption")
 
 
@@ -367,6 +371,8 @@ def _layout_block(box: Box, containing_width: float, ctx: LayoutContext,
     # --- children ----------------------------------------------------
     if box.kind == "flex":
         content_h = _layout_flex(box, content_w, ctx)
+    elif box.kind == "grid":
+        content_h = _layout_grid(box, content_w, ctx)
     elif box.kind == "table":
         content_h = _layout_table(box, content_w, ctx)
     elif box.kind in ("table-row", "table-row-group"):
@@ -402,7 +408,7 @@ def _has_inline_content(box: Box) -> bool:
                 has_inline = True
         elif c.kind in ("inline", "inline-block", "image"):
             has_inline = True
-        elif c.kind in ("block", "flex", "table", "list-item", "table-row",
+        elif c.kind in ("block", "flex", "grid", "table", "list-item", "table-row",
                         "table-cell", "table-row-group", "table-caption"):
             return False
     return has_inline
@@ -544,12 +550,21 @@ def _text_atoms(text: str, st: ComputedStyle, chain: tuple, ctx: LayoutContext) 
                 out.append(mk(part))
         return out
 
-    # normal / nowrap: collapse whitespace
+    # normal / nowrap: collapse whitespace runs to one space, but *keep* a
+    # single leading/trailing space when the source had one.  Dropping them
+    # glues adjacent inline nodes together ("Birds are" + "vertebrate" +
+    # "animals" -> "Birdsarevertebrateanimals").
     collapsed = " ".join(text.split())
     if not collapsed:
-        if text and out:
-            pass
+        # A whitespace-only node between two inline elements is the separator
+        # between them ("<b>class</b> <i>Aves</i>"); it must still emit a space.
+        if text:
+            out.append(mk(" "))
         return out
+    if text[:1].isspace():
+        collapsed = " " + collapsed
+    if text[-1:].isspace():
+        collapsed = collapsed + " "
     # split into words and spaces, keeping spaces as separate atoms
     buf = []
     for ch in collapsed:
@@ -920,6 +935,352 @@ def _num(v) -> float:
         return float(str(v).strip().rstrip("px"))
     except (TypeError, ValueError):
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Grid layout
+# ---------------------------------------------------------------------------
+
+def _split_tracks(value: str) -> list[str]:
+    """Split a track list on top-level whitespace, keeping ``minmax(a, b)`` whole."""
+    out, depth, cur = [], 0, ""
+    for ch in value or "":
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch.isspace() and depth == 0:
+            if cur:
+                out.append(cur)
+                cur = ""
+            continue
+        cur += ch
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _parse_track_list(value: str, available: float, ctx: LayoutContext,
+                      font_size: float) -> list[tuple[str, float, float]]:
+    """Parse ``grid-template-columns``/``-rows`` into (kind, a, b) tracks.
+
+    kind is ``px`` (fixed), ``fr`` (flexible) or ``auto`` (content-sized).
+    ``minmax(a, b)`` becomes a track whose minimum is ``a`` and maximum ``b``.
+    """
+    value = (value or "none").strip()
+    if not value or value == "none":
+        return []
+    tracks: list[tuple[str, float, float]] = []
+    for token in _split_tracks(value):
+        low = token.lower()
+        if low.startswith("repeat(") and low.endswith(")"):
+            inner = token[7:-1]
+            parts = [p.strip() for p in inner.split(",", 1)]
+            if len(parts) != 2:
+                continue
+            count_text, track_text = parts
+            if count_text.lower() == "auto-fill" or count_text.lower() == "auto-fit":
+                # Fill the row with as many copies as fit at their minimum size.
+                sub = _parse_track_list(track_text, available, ctx, font_size)
+                if not sub:
+                    continue
+                min_w = sum(max(0.0, t[1]) for t in sub) or 1.0
+                count = max(1, int(available // min_w)) if available > 0 else 1
+            else:
+                try:
+                    count = max(0, int(count_text))
+                except ValueError:
+                    continue
+            sub = _parse_track_list(track_text, available, ctx, font_size)
+            for _ in range(count):
+                tracks.extend(sub)
+            continue
+        if low.startswith("minmax(") and low.endswith(")"):
+            inner = token[7:-1]
+            parts = [p.strip() for p in inner.split(",")]
+            if len(parts) != 2:
+                continue
+            lo, hi = parts
+            lo_len = parse_length(lo)
+            hi_len = parse_length(hi)
+            lo_px = 0.0 if lo_len is None or lo_len.unit == "auto" else ctx.px(lo_len, available, font_size)
+            if hi_len is not None and hi_len.unit == "fr":
+                tracks.append(("fr", lo_px, hi_len.value))
+            elif hi_len is None or hi_len.unit == "auto":
+                tracks.append(("auto", lo_px, 0.0))
+            else:
+                tracks.append(("px", max(lo_px, ctx.px(hi_len, available, font_size)), 0.0))
+            continue
+        length = parse_length(token)
+        if length is None:
+            tracks.append(("auto", 0.0, 0.0))
+        elif length.unit == "fr":
+            tracks.append(("fr", 0.0, length.value))
+        elif length.unit == "auto":
+            tracks.append(("auto", 0.0, 0.0))
+        else:
+            tracks.append(("px", ctx.px(length, available, font_size), 0.0))
+    return tracks
+
+
+def _grid_line(value: str, explicit: int) -> tuple[int, int]:
+    """Resolve a ``grid-column``/``grid-row`` value to (start, span), 1-based.
+
+    Returns (0, 1) for ``auto`` so the auto-placement pass can decide.
+    """
+    value = (value or "auto").strip().lower()
+    if not value or value == "auto":
+        return 0, 1
+    if "/" in value:
+        start_text, end_text = [p.strip() for p in value.split("/", 1)]
+    else:
+        start_text, end_text = value, ""
+    span = 1
+    start = 0
+    if start_text.startswith("span "):
+        try:
+            span = max(1, int(start_text.split()[1]))
+        except (IndexError, ValueError):
+            span = 1
+    else:
+        try:
+            start = int(start_text)
+        except ValueError:
+            start = 0
+    if end_text:
+        if end_text.startswith("span "):
+            try:
+                span = max(1, int(end_text.split()[1]))
+            except (IndexError, ValueError):
+                span = 1
+        else:
+            try:
+                end = int(end_text)
+                if start and end > start:
+                    span = end - start
+            except ValueError:
+                pass
+    if start < 0:
+        start = max(1, explicit + 1 + start)
+    return start, span
+
+
+def _layout_grid(box: Box, width: float, ctx: LayoutContext) -> float:
+    """CSS Grid: explicit tracks, ``fr`` distribution, auto-placement, gaps."""
+    st = box.style
+    fs = _font_size(st)
+    row_gap = _resolve(st, "row-gap", width, ctx)
+    col_gap = _resolve(st, "column-gap", width, ctx)
+    if row_gap == 0 and col_gap == 0:
+        gap = _resolve(st, "gap", width, ctx)
+        row_gap = col_gap = gap
+
+    items: list[Box] = []
+    for c in box.children:
+        if c.kind == "text" and not (c.text or "").strip():
+            continue
+        if c.kind in ("text", "inline", "inline-block", "image"):
+            anon = Box(None, box.style, "block")
+            anon.is_anonymous = True
+            anon.children = [c]
+            c.parent = anon
+            items.append(anon)
+        else:
+            items.append(c)
+
+    cols = _parse_track_list(st.get("grid-template-columns", "none"), width, ctx, fs)
+    rows = _parse_track_list(st.get("grid-template-rows", "none"), width, ctx, fs)
+
+    # Resolve explicit placement first so implicit tracks can be sized.
+    placements: list[tuple[Box, int, int, int, int]] = []
+    max_col = len(cols)
+    max_row = len(rows)
+    for it in items:
+        c_start, c_span = _grid_line(it.style.get("grid-column", "auto"), len(cols))
+        r_start, r_span = _grid_line(it.style.get("grid-row", "auto"), len(rows))
+        placements.append((it, c_start, c_span, r_start, r_span))
+        if c_start:
+            max_col = max(max_col, c_start + c_span - 1)
+        if r_start:
+            max_row = max(max_row, r_start + r_span - 1)
+
+    # Auto-placement: fill row by row, skipping occupied cells.
+    occupied: set[tuple[int, int]] = set()
+    for it, c_start, c_span, r_start, r_span in placements:
+        if c_start and r_start:
+            for r in range(r_start, r_start + r_span):
+                for c in range(c_start, c_start + c_span):
+                    occupied.add((r, c))
+
+    resolved: list[tuple[Box, int, int, int, int]] = []
+    cursor_r, cursor_c = 1, 1
+    for it, c_start, c_span, r_start, r_span in placements:
+        if c_start and r_start:
+            resolved.append((it, c_start, c_span, r_start, r_span))
+            continue
+        if c_start and not r_start:
+            r = 1
+            while True:
+                if all((r + dr, c_start + dc) not in occupied
+                       for dr in range(r_span) for dc in range(c_span)):
+                    break
+                r += 1
+            r_start = r
+        elif r_start and not c_start:
+            c = 1
+            while True:
+                if all((r_start + dr, c + dc) not in occupied
+                       for dr in range(r_span) for dc in range(c_span)):
+                    break
+                c += 1
+            c_start = c
+        else:
+            while True:
+                if cursor_c + c_span - 1 > max(1, max_col):
+                    cursor_r += 1
+                    cursor_c = 1
+                if all((cursor_r + dr, cursor_c + dc) not in occupied
+                       for dr in range(r_span) for dc in range(c_span)):
+                    break
+                cursor_c += 1
+            c_start, r_start = cursor_c, cursor_r
+            cursor_c += c_span
+        for r in range(r_start, r_start + r_span):
+            for c in range(c_start, c_start + c_span):
+                occupied.add((r, c))
+        max_col = max(max_col, c_start + c_span - 1)
+        max_row = max(max_row, r_start + r_span - 1)
+        resolved.append((it, c_start, c_span, r_start, r_span))
+
+    n_cols = max(1, max_col)
+    n_rows = max(1, max_row)
+    while len(cols) < n_cols:
+        cols.append(("auto", 0.0, 0.0))
+    while len(rows) < n_rows:
+        rows.append(("auto", 0.0, 0.0))
+
+    # --- column sizing -------------------------------------------------
+    # Every item is laid out exactly once here; the *placement* pass below only
+    # re-lays an item when the grid actually resized it.  Re-laying everything
+    # twice made nested grids (whose children are themselves grids) cost
+    # exponential time on real pages.
+    for it in items:
+        _edges(it, width, ctx)
+        _layout_block(it, width, ctx)
+
+    col_min = [0.0] * n_cols
+    for it, c_start, c_span, _r, _rs in resolved:
+        if c_span == 1:
+            idx = c_start - 1
+            col_min[idx] = max(col_min[idx], it.w)
+
+    total_gap = col_gap * (n_cols - 1)
+    fixed = sum(t[1] for t in cols if t[0] == "px")
+    fr_total = sum(t[2] for t in cols if t[0] == "fr")
+    auto_cols = [i for i, t in enumerate(cols) if t[0] == "auto"]
+    for i in auto_cols:
+        col_min[i] = max(col_min[i], 0.0)
+
+    free = width - total_gap - fixed - sum(col_min[i] for i in auto_cols)
+    col_sizes = [0.0] * n_cols
+    for i, t in enumerate(cols):
+        if t[0] == "px":
+            col_sizes[i] = t[1]
+        elif t[0] == "auto":
+            col_sizes[i] = col_min[i]
+    if fr_total > 0 and free > 0:
+        for i, t in enumerate(cols):
+            if t[0] == "fr":
+                col_sizes[i] = free * t[2] / fr_total
+    elif fr_total > 0:
+        # Not enough room: give each fr track an equal share of what is left.
+        share = max(0.0, free) / fr_total
+        for i, t in enumerate(cols):
+            if t[0] == "fr":
+                col_sizes[i] = share * t[2]
+    # Distribute any leftover space across auto tracks so the grid fills its box.
+    used = sum(col_sizes) + total_gap
+    if used < width and auto_cols:
+        extra = (width - used) / len(auto_cols)
+        for i in auto_cols:
+            col_sizes[i] += extra
+
+    col_x = [0.0] * n_cols
+    x = 0.0
+    for i in range(n_cols):
+        col_x[i] = x
+        x += col_sizes[i] + col_gap
+
+    # --- row sizing ----------------------------------------------------
+    row_sizes = [0.0] * n_rows
+    for i, t in enumerate(rows):
+        if t[0] == "px":
+            row_sizes[i] = t[1]
+    for it, c_start, c_span, r_start, r_span in resolved:
+        if r_span == 1:
+            row_sizes[r_start - 1] = max(row_sizes[r_start - 1], it.h)
+    fr_rows = sum(t[2] for t in rows if t[0] == "fr")
+    if fr_rows > 0:
+        fixed_rows = sum(row_sizes)
+        avail = _resolve(st, "height", 0, ctx) or 0.0
+        if avail > 0:
+            free_r = max(0.0, avail - fixed_rows - row_gap * (n_rows - 1))
+            for i, t in enumerate(rows):
+                if t[0] == "fr":
+                    row_sizes[i] = free_r * t[2] / fr_rows
+
+    row_y = [0.0] * n_rows
+    y = 0.0
+    for i in range(n_rows):
+        row_y[i] = y
+        y += row_sizes[i] + row_gap
+
+    # --- place items ---------------------------------------------------
+    align_items = st.get("align-items", "stretch")
+    justify_items = st.get("justify-items", "stretch")
+    for it, c_start, c_span, r_start, r_span in resolved:
+        cell_x = col_x[c_start - 1]
+        cell_w = sum(col_sizes[c_start - 1:c_start - 1 + c_span]) + col_gap * (c_span - 1)
+        cell_y = row_y[r_start - 1]
+        cell_h = sum(row_sizes[r_start - 1:r_start - 1 + r_span]) + row_gap * (r_span - 1)
+
+        align_self = it.style.get("align-self", "auto")
+        a = align_items if align_self == "auto" else align_self
+        justify_self = it.style.get("justify-self", "auto")
+        j = justify_items if justify_self == "auto" else justify_self
+
+        target_w = cell_w
+        if j in (("start", "end", "center")):
+            target_w = min(it.w, cell_w)
+        # Only pay for a second layout when the cell width differs from what the
+        # item was measured at.  Nested grid/flex containers are *not* re-laid
+        # here: doing so recursed once per nesting level and made real pages
+        # (Wikipedia nests grids several deep) cost exponential time and memory.
+        # They keep their measured width; their own children were already laid
+        # out against it.
+        inner_w = max(0.0, target_w - it.pl - it.pr - it.bl - it.br)
+        if abs(inner_w - it.content_w) > 0.5 and it.kind not in ("grid", "flex"):
+            _layout_block(it, max(1.0, inner_w), ctx, forced_w=inner_w)
+        it.w = target_w
+        it.content_w = inner_w
+
+        if a == "stretch" and _len(it.style, "height", 0, ctx).unit == "auto":
+            it.h = cell_h
+            it.content_h = max(0.0, cell_h - it.pt - it.pb - it.bt - it.bb)
+
+        dx = cell_x
+        if j == "center":
+            dx += (cell_w - it.w) / 2
+        elif j == "end":
+            dx += cell_w - it.w
+        dy = cell_y
+        if a == "center":
+            dy += (cell_h - it.h) / 2
+        elif a in ("end", "flex-end"):
+            dy += cell_h - it.h
+        _shift(it, box.content_x + dx, box.content_y + dy)
+
+    return y - row_gap if n_rows else 0.0
 
 
 # ---------------------------------------------------------------------------
