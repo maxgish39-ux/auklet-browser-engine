@@ -1,26 +1,36 @@
-"""Auklet network stack: HTTP/1.1 protocol primitives.
+"""Auklet network stack: HTTP/1.1 over raw sockets, with TLS.
 
-This module holds the parts of the client that are pure protocol work:
+This is a real client, not a wrapper around ``urllib``/``requests``:
 
-* URL normalisation and resolution.
-* An RFC 6265 cookie jar (domain/path matching, ``Secure``, ``HttpOnly``,
-  ``Max-Age``/``Expires`` in all three accepted date formats).
-* Response decoding: declared charset, BOM sniffing, ``<meta charset>``
-  sniffing and a cp1252 fallback.
-* Content-Encoding decoding for ``gzip``, ``deflate`` and ``br``.
-* Proxy selection from the environment, with ``NO_PROXY`` matching.
+* TCP via :mod:`socket`, TLS via :mod:`ssl` with SNI, ALPN (``http/1.1``) and
+  hostname verification.
+* HTTP/1.1 request serialisation and response parsing: status line, headers,
+  ``Content-Length`` **and** ``Transfer-Encoding: chunked`` bodies.
+* Content-Encoding negotiation: ``gzip``, ``deflate`` and ``br`` (brotli).
+* Redirect following with method/body preservation rules.
+* ``Expect: 100-continue`` handling and interim (1xx) response skipping.
+* A persistent connection pool keyed by (scheme, host, port), with
+  ``Connection: close`` honoured and dead sockets evicted.
+* HTTP proxies: plain ``http`` targets use absolute-form request lines;
+  ``https`` targets tunnel through ``CONNECT``.  Read from ``$HTTPS_PROXY`` /
+  ``$HTTP_PROXY`` / ``$ALL_PROXY`` (and lowercase), bypassed by ``$NO_PROXY``.
+* An RFC 6265 cookie jar with domain/path matching, expiry and ``Secure``.
 
-The socket machinery and the request/response cycle live in
-:mod:`auklet.http_client` and are re-exported here, so ``from auklet.netstack
-import HttpClient`` keeps working.
+The module deliberately has **no third-party dependencies**; brotli decoding is
+used only when the optional ``brotli`` package is importable, and the
+``Accept-Encoding`` header advertises only what we can actually decode.
 """
 
 from __future__ import annotations
 
+import base64
 import gzip
+import io
 import ipaddress
 import os
 import re
+import socket
+import ssl
 import time
 import zlib
 from dataclasses import dataclass, field
@@ -29,7 +39,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 try:  # optional
     import brotli as _brotli  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover - depends on the environment
     _brotli = None
 
 DEFAULT_UA = (
@@ -43,6 +53,10 @@ REDIRECT_CODES = (301, 302, 303, 307, 308)
 class NetworkError(Exception):
     """A transport-level failure (DNS, TCP, TLS, malformed response)."""
 
+
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
 
 def _split(url: str):
     parts = urlsplit(url)
@@ -128,6 +142,10 @@ def proxy_for(scheme: str, host: str) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Cookies (RFC 6265)
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Cookie:
     name: str
@@ -136,7 +154,7 @@ class Cookie:
     path: str = "/"
     secure: bool = False
     http_only: bool = False
-    expires: Optional[float] = None
+    expires: Optional[float] = None      # epoch seconds
     host_only: bool = True
 
     def expired(self, now: Optional[float] = None) -> bool:
@@ -151,6 +169,7 @@ class CookieJar:
     def __init__(self):
         self.cookies: list[Cookie] = []
 
+    # -- storage ------------------------------------------------------
     def set_from_headers(self, url: str, headers: list[tuple[str, str]]) -> None:
         scheme, host, _port, path = _split(url)
         host = (host or "").lower()
@@ -242,7 +261,9 @@ _MONTHS = {m: i for i, m in enumerate(
 
 
 def _parse_cookie_date(value: str) -> Optional[float]:
+    """Parse the three date formats RFC 6265 requires us to accept."""
     value = value.strip()
+    # RFC 1123: Sun, 06 Nov 1994 08:49:37 GMT
     m = re.match(r"[A-Za-z]{3},\s*(\d{1,2})[-\s]([A-Za-z]{3})[-\s](\d{2,4})\s+"
                  r"(\d{1,2}):(\d{2}):(\d{2})", value)
     if not m:
@@ -267,6 +288,10 @@ def _epoch(year: int, month: int, day: int, hh: int, mm: int, ss: int) -> Option
     except Exception:
         return None
 
+
+# ---------------------------------------------------------------------------
+# Response
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Response:
@@ -296,6 +321,7 @@ class Response:
 
     @property
     def charset(self) -> Optional[str]:
+        """Charset from the Content-Type header, if declared."""
         ctype = self.header("content-type")
         m = re.search(r"charset\s*=\s*[\"']?([\w\-:.]+)", ctype, re.I)
         return m.group(1) if m else None
@@ -343,6 +369,10 @@ def decode_body(body: bytes, charset: Optional[str] = None,
         return body.decode("cp1252", errors="replace")
 
 
+# ---------------------------------------------------------------------------
+# Decompression
+# ---------------------------------------------------------------------------
+
 def _gunzip(data: bytes) -> bytes:
     try:
         return gzip.decompress(data)
@@ -365,6 +395,7 @@ def decompress(body: bytes, encoding: str) -> bytes:
     enc = (encoding or "").strip().lower()
     if not enc or enc == "identity" or not body:
         return body
+    # A Content-Encoding can list several codings, applied in order.
     for part in reversed([e.strip() for e in enc.split(",") if e.strip()]):
         if part in ("gzip", "x-gzip"):
             body = _gunzip(body)
@@ -383,8 +414,7 @@ def supported_encodings() -> str:
         encs.insert(0, "br")
     return ", ".join(encs)
 
-
 # The connection/request cycle lives in ``http_client`` so each module stays a
-# readable size.  Imported at the bottom because it depends on the primitives
-# defined above.
-from .http_client import HttpClient, fetch  # noqa: E402,F401
+# readable size.  It is imported at the bottom because it depends on the
+# primitives defined above.
+from .http_client import HttpClient, fetch # noqa: E402,F401
