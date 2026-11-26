@@ -1,1 +1,34 @@
-IiIiQXVrbGV0J3MgYnJvd3NlciB1c2VyIGludGVyZmFjZS4KClRoZSBVSSBpcyBhIHBhY2thZ2UgKGBgYXVrbGV0LmJyb3dzZXJfdWlgYCkuICBUaGlzIG1vZHVsZSBpcyB0aGUgZW50cnkgcG9pbnQgc28KYGBweXRob24gLW0gYXVrbGV0LnVpYGAga2VlcHMgd29ya2luZyBhbmQgYGBmcm9tIGF1a2xldC51aSBpbXBvcnQgQnJvd3NlcldpbmRvd2BgCnJlc29sdmVzIHRvIHRoZSBzYW1lIGNsYXNzLgoKKiA6bW9kOmBhdWtsZXQuYnJvd3Nlcl91aS53aW5kb3dgIC0gdGhlIFRrIGFwcGxpY2F0aW9uOiB0YWIgc3RyaXAsIGFkZHJlc3MgYmFyLAogIG5hdmlnYXRpb24gYnV0dG9ucywgc2Nyb2xsaW5nIHZpZXdwb3J0LCBzdGF0dXMgYmFyLgoqIDptb2Q6YGF1a2xldC5uYXZpZ2F0aW9uYCAtIHRhYnMsIGhpc3RvcnkgYW5kIHNjcm9sbCBzdGF0ZSwgVUktaW5kZXBlbmRlbnQgYW5kCiAgdGVzdGFibGUgaGVhZGxlc3NseS4KClJ1biBpdCB3aXRoOjoKCiAgICBweXRob24gLW0gYXVrbGV0LnVpIGh0dHBzOi8vZXhhbXBsZS5jb20KIiIiCgpmcm9tIF9fZnV0dXJlX18gaW1wb3J0IGFubm90YXRpb25zCgppbXBvcnQgc3lzCmZyb20gdHlwaW5nIGltcG9ydCBPcHRpb25hbAoKZnJvbSAuYnJvd3Nlcl91aSBpbXBvcnQgQnJvd3NlcldpbmRvdwpmcm9tIC5icm93c2VyX3VpLndpbmRvdyBpbXBvcnQgcnVuCgpfX2FsbF9fID0gWyJCcm93c2VyV2luZG93IiwgInJ1biIsICJtYWluIl0KCgpkZWYgbWFpbihhcmd2OiBPcHRpb25hbFtsaXN0W3N0cl1dID0gTm9uZSkgLT4gaW50OgogICAgYXJncyA9IGxpc3Qoc3lzLmFyZ3ZbMTpdIGlmIGFyZ3YgaXMgTm9uZSBlbHNlIGFyZ3YpCiAgICByZXR1cm4gcnVuKGFyZ3NbMF0gaWYgYXJncyBlbHNlICIiKQoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICByYWlzZSBTeXN0ZW1FeGl0KG1haW4oKSkK
+"""Auklet's browser user interface.
+
+The UI is a package (``auklet.browser_ui``).  This module is the entry point so
+``python -m auklet.ui`` keeps working and ``from auklet.ui import BrowserWindow``
+resolves to the same class.
+
+* :mod:`auklet.browser_ui.window` - the Tk application: tab strip, address bar,
+  navigation buttons, scrolling viewport, status bar.
+* :mod:`auklet.navigation` - tabs, history and scroll state, UI-independent and
+  testable headlessly.
+
+Run it with::
+
+    python -m auklet.ui https://example.com
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import Optional
+
+from .browser_ui import BrowserWindow
+from .browser_ui.window import run
+
+__all__ = ["BrowserWindow", "run", "main"]
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    return run(args[0] if args else "")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
