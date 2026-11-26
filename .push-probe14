@@ -1,6 +1,0 @@
-"""Auklet UI.
-
-The UI is a package (auklet.browser_ui).  This module is the entry point so
-python -m auklet.ui keeps working and from auklet.ui import BrowserWindow
-resolves to the same class.
-"""
