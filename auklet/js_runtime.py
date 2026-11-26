@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Callable, Optional
 
 import quickjs
@@ -275,6 +276,273 @@ PRELUDE = r"""
   global.Text = TextWrap;
   global.__wrap = wrap;
   global.__makeList = makeList;
+
+  // ---------------------------------------------------------------- fetch
+  // A real Fetch API.  The request itself is performed by the engine's own
+  // HTTP client on a worker thread; this side owns the Promise, the Response
+  // object and the body accessors.
+  function Headers(init){
+    this._map = {};
+    this._list = [];
+    if (init) {
+      if (init instanceof Headers) {
+        init.forEach(function(v, k){ this.append(k, v); }, this);
+      } else if (Array.isArray(init)) {
+        for (var i = 0; i < init.length; i++) this.append(init[i][0], init[i][1]);
+      } else {
+        for (var k in init) if (Object.prototype.hasOwnProperty.call(init, k)) this.append(k, init[k]);
+      }
+    }
+  }
+  Headers.prototype = {
+    append: function(name, value){
+      name = String(name).toLowerCase(); value = String(value);
+      if (!this._map[name]) { this._map[name] = []; this._list.push(name); }
+      this._map[name].push(value);
+    },
+    set: function(name, value){
+      name = String(name).toLowerCase();
+      if (!this._map[name]) this._list.push(name);
+      this._map[name] = [String(value)];
+    },
+    get: function(name){
+      var v = this._map[String(name).toLowerCase()];
+      return v && v.length ? v.join(", ") : null;
+    },
+    getAll: function(name){ return (this._map[String(name).toLowerCase()] || []).slice(); },
+    has: function(name){ return !!this._map[String(name).toLowerCase()]; },
+    "delete": function(name){
+      name = String(name).toLowerCase();
+      if (this._map[name]) { delete this._map[name]; this._list = this._list.filter(function(x){ return x !== name; }); }
+    },
+    forEach: function(fn, thisArg){
+      for (var i = 0; i < this._list.length; i++) {
+        var n = this._list[i], vals = this._map[n];
+        for (var j = 0; j < vals.length; j++) fn.call(thisArg, vals[j], n, this);
+      }
+    },
+    keys: function(){ return this._list.slice()[Symbol.iterator](); },
+    entries: function(){
+      var out = []; this.forEach(function(v, k){ out.push([k, v]); });
+      return out[Symbol.iterator]();
+    },
+    [Symbol.iterator]: function(){ return this.entries(); }
+  };
+
+  function _b64ToBytes(b64){
+    var arr = JSON.parse(__b64decode(b64));
+    var out = new Uint8Array(arr.length);
+    for (var i = 0; i < arr.length; i++) out[i] = arr[i] & 0xff;
+    return out;
+  }
+
+  function ResponseBody(text, b64){
+    this._text = text;
+    this._b64 = b64;
+    this._used = false;
+    this.bodyUsed = false;
+  }
+  ResponseBody.prototype = {
+    _consume: function(){
+      if (this._used) throw new TypeError("body stream already read");
+      this._used = true; this.bodyUsed = true;
+    },
+    text: function(){
+      var self = this;
+      return new Promise(function(resolve){
+        self._consume();
+        resolve(self._text);
+      });
+    },
+    json: function(){
+      var self = this;
+      return new Promise(function(resolve, reject){
+        self._consume();
+        try { resolve(JSON.parse(self._text)); }
+        catch (e) { reject(new SyntaxError("invalid JSON: " + e.message)); }
+      });
+    },
+    arrayBuffer: function(){
+      var self = this;
+      return new Promise(function(resolve){
+        self._consume();
+        var bytes = _b64ToBytes(self._b64);
+        resolve(bytes.buffer);
+      });
+    },
+    blob: function(){
+      var self = this;
+      return new Promise(function(resolve){
+        self._consume();
+        resolve({ size: _b64ToBytes(self._b64).length, type: "" });
+      });
+    }
+  };
+
+  function Response(info){
+    this.url = info.url;
+    this.status = info.status;
+    this.statusText = info.statusText;
+    this.ok = info.ok;
+    this.redirected = info.redirected;
+    this.type = "basic";
+    this.headers = new Headers(info.headers);
+    this._body = new ResponseBody(info.text, info.b64);
+  }
+  Response.prototype = {
+    get bodyUsed(){ return this._body.bodyUsed; },
+    text: function(){ return this._body.text(); },
+    json: function(){ return this._body.json(); },
+    arrayBuffer: function(){ return this._body.arrayBuffer(); },
+    blob: function(){ return this._body.blob(); },
+    clone: function(){
+      var c = Object.create(Response.prototype);
+      c.url = this.url; c.status = this.status; c.statusText = this.statusText;
+      c.ok = this.ok; c.redirected = this.redirected; c.type = this.type;
+      c.headers = new Headers(this.headers);
+      c._body = new ResponseBody(this._body._text, this._body._b64);
+      return c;
+    }
+  };
+
+  function _normalizeRequest(input, init){
+    init = init || {};
+    var url, method = init.method || "GET", headers = init.headers, body = init.body;
+    if (typeof input === "string") {
+      url = input;
+    } else if (input && typeof input === "object") {
+      url = input.url;
+      if (!init.method && input.method) method = input.method;
+      if (!init.headers && input.headers) headers = input.headers;
+      if (init.body === undefined && input.body !== undefined) body = input.body;
+    } else {
+      url = String(input);
+    }
+    var hdrs = {};
+    if (headers) {
+      var h = headers instanceof Headers ? headers : new Headers(headers);
+      h.forEach(function(v, k){ hdrs[k] = v; });
+    }
+    if (body !== undefined && body !== null && typeof body !== "string") {
+      if (body instanceof ArrayBuffer) {
+        body = __bytesToStr(new Uint8Array(body));
+      } else if (body && body.byteLength !== undefined) {
+        body = __bytesToStr(new Uint8Array(body));
+      } else {
+        body = String(body);
+      }
+    }
+    return { url: url, method: String(method).toUpperCase(), headers: hdrs,
+             body: (body === undefined || body === null) ? null : String(body) };
+  }
+
+  function fetch(input, init){
+    return new Promise(function(resolve, reject){
+      var req;
+      try { req = _normalizeRequest(input, init); }
+      catch (e) { reject(new TypeError("fetch: " + e.message)); return; }
+      var jobId;
+      try {
+        jobId = __fetchStart(req.method, req.url, JSON.stringify(req.headers),
+                             req.body === null ? null : req.body);
+      } catch (e) {
+        reject(new TypeError("fetch failed: " + e.message));
+        return;
+      }
+      function poll(){
+        var st;
+        try { st = JSON.parse(__fetchState(jobId)); }
+        catch (e) { reject(new TypeError("fetch failed: " + e.message)); return; }
+        if (st.state === "pending") { __fetchLater(poll); return; }
+        __fetchRelease(jobId);
+        if (st.state === "error") {
+          reject(new TypeError("fetch failed: " + (st.message || "network error")));
+          return;
+        }
+        resolve(new Response(st.response));
+      }
+      poll();
+    });
+  }
+  global.fetch = fetch;
+  global.Headers = Headers;
+  global.Response = Response;
+  global.Request = function(input, init){
+    var r = _normalizeRequest(input, init);
+    this.url = r.url; this.method = r.method;
+    this.headers = new Headers(r.headers); this.body = r.body;
+  };
+
+  // ------------------------------------------------------------ storage
+  // localStorage is a real persistent per-origin store backed by SQLite.
+  // Index access (localStorage[0]) and `in` work through a Proxy, and
+  // Object.keys() sees the stored keys, as the spec requires.
+  function _makeStorage(){
+    var target = {
+      getItem: function(k){ var v = __lsGet(String(k)); return v === null ? null : v; },
+      setItem: function(k, v){ __lsSet(String(k), String(v)); },
+      removeItem: function(k){ __lsRemove(String(k)); },
+      clear: function(){ __lsClear(); },
+      key: function(i){ var v = __lsKey(i); return v === null ? null : v; }
+    };
+    // The Storage interface's members are not enumerable, so Object.keys()
+    // reports only the stored keys -- as the spec requires.
+    Object.getOwnPropertyNames(target).forEach(function(name){
+      Object.defineProperty(target, name, { enumerable: false });
+    });
+    Object.defineProperty(target, "length", {
+      get: function(){ return __lsLength(); }, enumerable: false
+    });
+    function _isIndex(prop){
+      return typeof prop === "string" && /^(0|[1-9][0-9]*)$/.test(prop);
+    }
+    return new Proxy(target, {
+      get: function(t, prop){
+        if (prop in t) return t[prop];
+        if (_isIndex(prop)) {
+          var k = __lsKey(Number(prop));
+          return k === null ? undefined : k;
+        }
+        if (typeof prop === "string") {
+          var v = __lsGet(prop);
+          if (v !== null) return v;
+        }
+        return undefined;
+      },
+      set: function(t, prop, value){
+        if (prop in t) { t[prop] = value; return true; }
+        __lsSet(String(prop), String(value));
+        return true;
+      },
+      has: function(t, prop){
+        if (prop in t) return true;
+        if (_isIndex(prop)) return __lsKey(Number(prop)) !== null;
+        return typeof prop === "string" && __lsGet(prop) !== null;
+      },
+      "deleteProperty": function(t, prop){
+        if (prop in t) return false;
+        __lsRemove(String(prop));
+        return true;
+      },
+      ownKeys: function(t){
+        var keys = JSON.parse(__lsKeys());
+        return keys.concat(Object.getOwnPropertyNames(t));
+      },
+      getOwnPropertyDescriptor: function(t, prop){
+        if (prop in t) return Object.getOwnPropertyDescriptor(t, prop);
+        var v;
+        if (_isIndex(prop)) {
+          v = __lsKey(Number(prop));
+        } else {
+          v = __lsGet(String(prop));
+        }
+        if (v === null) return undefined;
+        return { value: v, writable: true, enumerable: true, configurable: true };
+      }
+    });
+  }
+  global.localStorage = _makeStorage();
+  global.sessionStorage = _makeStorage();
 })(this);
 """
 
@@ -284,7 +552,8 @@ class JSRuntime:
 
     def __init__(self, document: Document, viewport=(1280, 800),
                  on_mutation: Optional[Callable[[], None]] = None,
-                 on_console: Optional[Callable[[str, str], None]] = None):
+                 on_console: Optional[Callable[[str, str], None]] = None,
+                 http_client=None, storage=None, base_url: str = ""):
         self.doc = document
         self.viewport = viewport
         self.on_mutation = on_mutation
@@ -297,6 +566,13 @@ class JSRuntime:
         self.timers: list[tuple[float, object, list]] = []
         self._now = 0.0
         self.errors: list[str] = []
+        self.base_url = base_url or getattr(document, "base_url", "") or ""
+        self.net_budget = 30.0
+        self.storage = storage
+        self.fetcher = None
+        if http_client is not None:
+            from .webapi import FetchManager
+            self.fetcher = FetchManager(http_client, base_url=self.base_url)
         self._install()
 
     # -- handle management ---------------------------------------------
@@ -419,6 +695,23 @@ class JSRuntime:
         ctx.add_callable("__clearTimer", lambda i: _clear_timer(rt, i))
         ctx.add_callable("__now", lambda: rt._now)
 
+        # --- fetch
+        ctx.add_callable("__fetchStart", lambda m, u, h, b: _fetch_start(rt, m, u, h, b))
+        ctx.add_callable("__fetchState", lambda j: _fetch_state(rt, j))
+        ctx.add_callable("__fetchRelease", lambda j: _fetch_release(rt, j))
+        ctx.add_callable("__fetchLater", lambda fn: _add_timer(rt, fn, 4, False))
+        ctx.add_callable("__b64decode", _b64_decode)
+        ctx.add_callable("__bytesToStr", _bytes_to_str)
+
+        # --- storage
+        ctx.add_callable("__lsGet", lambda k: _ls_get(rt, k))
+        ctx.add_callable("__lsSet", lambda k, v: _ls_set(rt, k, v))
+        ctx.add_callable("__lsRemove", lambda k: _ls_remove(rt, k))
+        ctx.add_callable("__lsClear", lambda: _ls_clear(rt))
+        ctx.add_callable("__lsKey", lambda i: _ls_key(rt, i))
+        ctx.add_callable("__lsLength", lambda: _ls_length(rt))
+        ctx.add_callable("__lsKeys", lambda: json.dumps(_ls_keys(rt)))
+
         # --- window
         ctx.eval(PRELUDE)
         ctx.eval(
@@ -446,9 +739,30 @@ class JSRuntime:
                 self.on_console("error", msg)
 
     def run_timers(self, budget: float = 2.0, max_steps: int = 2000) -> None:
-        """Run queued timers in virtual time until the queue drains."""
+        """Run queued timers in virtual time until the queue drains.
+
+        Microtasks (Promise callbacks) are drained after every timer, and the
+        loop keeps going while a fetch is still in flight, so an
+        ``await fetch(...)`` inside a page resolves before the engine
+        re-lays out.  Network waits are bounded by ``net_budget``.
+        """
         steps = 0
-        while self.timers and steps < max_steps:
+        net_deadline = time.monotonic() + self.net_budget
+        while steps < max_steps:
+            self._drain_microtasks()
+            # While a fetch is in flight, wait on real network progress before
+            # running the next poll timer.  Without this the poll timer would
+            # spin through virtual time far faster than the socket can answer,
+            # exhausting the step budget before the response arrives.
+            if self.fetcher is not None and self.fetcher.pending():
+                if time.monotonic() >= net_deadline:
+                    self.errors.append("fetch: timed out waiting for network")
+                    break
+                self.fetcher.wait(timeout=0.05)
+            if not self.timers:
+                if self.fetcher is not None and self.fetcher.pending():
+                    continue
+                break
             steps += 1
             self.timers.sort(key=lambda t: t[0])
             when, fn, args = self.timers.pop(0)
@@ -464,6 +778,17 @@ class JSRuntime:
                     self.on_console("error", f"timer: {exc}")
             if self._now > budget:
                 break
+        self._drain_microtasks()
+
+    def _drain_microtasks(self, limit: int = 10000) -> None:
+        """Run the QuickJS job queue (Promise reactions) to exhaustion."""
+        for _ in range(limit):
+            try:
+                if not self.ctx.execute_pending_job():
+                    return
+            except Exception as exc:
+                self.errors.append(f"microtask: {exc}")
+                return
 
     def fire_event(self, node: Node, event_type: str, extra: Optional[dict] = None) -> bool:
         h = self.handle(node)
@@ -894,3 +1219,94 @@ def _add_timer(rt, fn, ms, repeat) -> int:
 
 def _clear_timer(rt, tid) -> None:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Fetch bridge
+# ---------------------------------------------------------------------------
+
+def _fetch_start(rt, method, url, headers_json, body) -> int:
+    if rt.fetcher is None:
+        raise RuntimeError("fetch is unavailable: no HTTP client attached")
+    try:
+        headers = json.loads(headers_json) if headers_json else {}
+    except (TypeError, ValueError):
+        headers = {}
+    if not isinstance(headers, dict):
+        headers = {}
+    return rt.fetcher.start(str(method or "GET"), str(url or ""),
+                             headers=headers,
+                             body=None if body is None else str(body))
+
+
+def _fetch_state(rt, job_id) -> str:
+    if rt.fetcher is None:
+        return json.dumps({"state": "error", "message": "fetch unavailable"})
+    return json.dumps(rt.fetcher.state(job_id))
+
+
+def _fetch_release(rt, job_id) -> None:
+    if rt.fetcher is not None:
+        rt.fetcher.release(job_id)
+
+
+def _b64_decode(data) -> str:
+    """Decode base64 to a JSON array of byte values.
+
+    The QuickJS bridge truncates a returned string at the first NUL byte, so
+    binary bodies cannot cross as a string.  A JSON array of integers is
+    exact for every byte value; the JS side turns it into a Uint8Array.
+    """
+    import base64 as _b64
+    try:
+        raw = _b64.b64decode(str(data or ""))
+    except Exception:
+        return "[]"
+    return json.dumps(list(raw))
+
+
+def _bytes_to_str(data) -> str:
+    """Turn a JS Uint8Array (arriving as a list of ints) into a UTF-8 string."""
+    try:
+        return bytes(int(b) & 0xFF for b in data).decode("utf-8", errors="replace")
+    except (TypeError, ValueError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# localStorage bridge
+# ---------------------------------------------------------------------------
+
+def _ls_get(rt, key):
+    if rt.storage is None:
+        return None
+    return rt.storage.get(str(key))
+
+
+def _ls_set(rt, key, value) -> None:
+    if rt.storage is not None:
+        rt.storage.set(str(key), str(value))
+
+
+def _ls_remove(rt, key) -> None:
+    if rt.storage is not None:
+        rt.storage.remove(str(key))
+
+
+def _ls_clear(rt) -> None:
+    if rt.storage is not None:
+        rt.storage.clear()
+
+
+def _ls_key(rt, index):
+    if rt.storage is None:
+        return None
+    return rt.storage.key(index)
+
+
+def _ls_length(rt) -> int:
+    return rt.storage.length() if rt.storage is not None else 0
+
+
+def _ls_keys(rt) -> list:
+    return rt.storage.keys() if rt.storage is not None else []
