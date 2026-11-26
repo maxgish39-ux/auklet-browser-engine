@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auklet"
-version = "1.0.0"
-description = "A browser engine written from scratch: HTML parsing, CSS cascade, layout, rasterisation and a JavaScript runtime."
+version = "2.0.0"
+description = "A browser engine and browser UI written from scratch: HTTP/1.1+TLS, HTML parsing, CSS cascade, grid/flex layout, rasterisation and a JavaScript runtime."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: Browsers",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = ["Pillow>=9.0.0", "quickjs>=1.19.0", "numpy>=1.21.0"]
+dependencies = ["Pillow>=9.0.0", "quickjs>=1.19.0", "numpy>=1.21.0", "brotli>=1.0.9"]
 
 [project.urls]
 Homepage = "https://github.com/maxgish39-ux/auklet-browser-engine"
@@ -27,6 +27,7 @@ Source = "https://github.com/maxgish39-ux/auklet-browser-engine"
 
 [project.scripts]
 auklet = "auklet.cli:main"
+auklet-browser = "auklet.ui:main"
 
-[tool.setuptools]
-packages = ["auklet"]
+[tool.setuptools.packages.find]
+include = ["auklet*"]

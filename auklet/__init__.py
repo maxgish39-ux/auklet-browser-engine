@@ -15,7 +15,7 @@ from .html_parser import parse_html
 from .layout import Box, layout_document
 from .paint import Painter
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __all__ = [
     "Browser", "FrameStats", "ResourceLoader", "StyleEngine", "parse_stylesheet",
     "Comment", "Document", "Element", "Node", "Text", "parse_html", "Box",
