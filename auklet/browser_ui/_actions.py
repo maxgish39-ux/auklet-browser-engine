@@ -13,12 +13,16 @@ from typing import Optional
 from PIL import ImageTk
 
 from ..navigation import Tab
+from . import _chrome
 from ._chrome import ERROR, FG_DIM
 
 
 class ActionsMixin:
     """Behaviour mixed into :class:`auklet.browser_ui.window.BrowserWindow`."""
 
+    # ------------------------------------------------------------------
+    # Navigation actions
+    # ------------------------------------------------------------------
     def navigate(self, url: str) -> None:
         url = (url or "").strip()
         if not url:
@@ -63,6 +67,9 @@ class ActionsMixin:
         self.session.tab.scroll_to(y)
         self._schedule_render()
 
+    # ------------------------------------------------------------------
+    # Async plumbing
+    # ------------------------------------------------------------------
     def _run_async(self, fn) -> None:
         def work():
             try:
@@ -94,6 +101,9 @@ class ActionsMixin:
                 fg=ERROR if message.startswith("Error") else FG_DIM)
         self.btn_stop.configure(state="normal" if busy else "disabled")
 
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
     def _schedule_render(self) -> None:
         if self._render_job is not None:
             self.root.after_cancel(self._render_job)
@@ -132,6 +142,9 @@ class ActionsMixin:
             text=f"{tab.url}   \u2022   {pos}/{total}px   \u2022   {stats.summary()}",
             fg=FG_DIM)
 
+    # ------------------------------------------------------------------
+    # Chrome refresh
+    # ------------------------------------------------------------------
     def _on_session_change(self, _session) -> None:
         self._refresh_chrome()
         self._schedule_render()
@@ -146,7 +159,6 @@ class ActionsMixin:
         self._rebuild_tabs()
 
     def _rebuild_tabs(self) -> None:
-        from . import _chrome
         for child in self.tab_buttons.winfo_children():
             child.destroy()
         for i, tab in enumerate(self.session.tabs):
@@ -165,6 +177,9 @@ class ActionsMixin:
         self.session.close_tab(index)
         self._schedule_render()
 
+    # ------------------------------------------------------------------
+    # Input
+    # ------------------------------------------------------------------
     def _on_click(self, event) -> None:
         tab = self.session.tab
         if tab.engine.root_box is None:
@@ -177,3 +192,6 @@ class ActionsMixin:
 
     def _on_wheel(self, event) -> None:
         self.scroll(-event.delta * 3 if abs(event.delta) < 100 else -event.delta)
+
+    def run(self) -> None:
+        self.root.mainloop()
